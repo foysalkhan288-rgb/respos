@@ -73,6 +73,14 @@ CREATE TABLE IF NOT EXISTS kds_orders (
     dispatched_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS customers (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    phone TEXT,
+    reward_points INTEGER DEFAULT 0,
+    preferences TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items (order_id);
 CREATE INDEX IF NOT EXISTS idx_kds_orders_order_id ON kds_orders (order_id);
 """
@@ -145,6 +153,14 @@ async def seed_sample_data() -> None:
                 ('mod-002', 'extra shot', 'ing-003', 1.0, 'shot', 0.75),
                 ('mod-003', 'no whip', 'ing-006', -30.0, 'ml', 0.0),
                 ('mod-004', '50% sugar', 'ing-004', 15.0, 'ml', 0.0),
+            ],
+        )
+
+        await conn.executemany(
+            "INSERT OR IGNORE INTO customers (id, name, phone, reward_points, preferences) VALUES (?, ?, ?, ?, ?)",
+            [
+                ('cust-001', 'Alice Johnson', '+15551234567', 150, 'Prefers oat milk, extra shot'),
+                ('cust-002', 'Bob Smith', '+15559876543', 50, 'No sugar'),
             ],
         )
 

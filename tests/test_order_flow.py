@@ -201,3 +201,69 @@ async def test_low_stock_empty_initially(client: AsyncClient):
     data = resp.json()
     # All stocks are above threshold with initial seed data
     assert len(data) == 0
+
+
+@pytest.mark.asyncio
+async def test_customer_lookup_endpoint(client: AsyncClient):
+    resp = await client.get("/api/v1/customers/cust-001")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["id"] == "cust-001"
+    assert data["name"] == "Alice Johnson"
+    assert data["reward_points"] == 150
+
+
+@pytest.mark.asyncio
+async def test_customer_lookup_not_found(client: AsyncClient):
+    resp = await client.get("/api/v1/customers/cust-999")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_loyalty_discount_applied(client: AsyncClient):
+    payload = {
+        "counter_number": "C3",
+        "customer_id": "cust-001",
+        "items": [
+            {
+                "menu_item_id": "latte-001",
+                "quantity": 1,
+                "modifiers": [],
+                "special_instructions": "",
+            }
+        ],
+        "payment_method": "cash",
+    }
+    response = await client.post("/api/v1/orders", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["customer"] is not None
+    assert data["customer"]["reward_points"] == 150
+    assert data["loyalty_discount"] is not None
+    assert data["loyalty_discount"] > 0
+    expected_total = round(data["subtotal"] + data["tax"] - data["loyalty_discount"], 2)
+    assert data["total"] == expected_total
+
+
+@pytest.mark.asyncio
+async def test_order_with_raw_text_field(client: AsyncClient):
+    """raw_order_text is passed through to graph state (LLM parsing requires API key)."""
+    payload = {
+        "counter_number": "C4",
+        "items": [
+            {
+                "menu_item_id": "espresso-001",
+                "quantity": 1,
+                "modifiers": [],
+                "special_instructions": "",
+            }
+        ],
+        "raw_order_text": "quick espresso please",
+        "payment_method": "card",
+    }
+    response = await client.post("/api/v1/orders", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["order_id"].startswith("ord-")
+    assert data["payment_status"] == "pending"
+    assert data["kds_status"] == "dispatched"

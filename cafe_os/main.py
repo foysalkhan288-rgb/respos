@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field
 
 from cafe_os.db import db_lifespan, get_connection
 from cafe_os.graph import run_order
-from cafe_os.tools import get_menu_item, lookup_modifiers
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +50,7 @@ class OrderIn(BaseModel):
     customer_id: Optional[str] = None
     items: List[OrderItemIn]
     payment_method: Optional[str] = None
+    raw_order_text: Optional[str] = None
 
 
 class OrderOut(BaseModel):
@@ -63,6 +63,8 @@ class OrderOut(BaseModel):
     payment_status: str
     kds_status: str
     inventory_alerts: List[str]
+    customer: Optional[dict] = None
+    loyalty_discount: Optional[float] = None
     error: Optional[str] = None
 
 
@@ -81,6 +83,14 @@ class LowStockOut(BaseModel):
     unit: str
     current_stock: float
     reorder_threshold: float
+
+
+class CustomerOut(BaseModel):
+    id: str
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    reward_points: Optional[int] = None
+    preferences: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +157,8 @@ async def get_order_endpoint(order_id: str):
         payment_status=order_row["payment_status"],
         kds_status=kds_status,
         inventory_alerts=[],
+        customer=None,
+        loyalty_discount=None,
         error=None,
     )
 
@@ -192,3 +204,31 @@ async def low_stock():
         )
         for row in rows
     ]
+
+
+@app.get("/api/v1/customers/{customer_id}", response_model=Optional[CustomerOut])
+async def get_customer(customer_id: str):
+    """Look up customer by ID for CRM personalization (stub for MVP)."""
+    try:
+        async with get_connection() as db:
+            cursor = await db.execute(
+                "SELECT id, name, phone, reward_points, preferences FROM customers WHERE id = ?",
+                (customer_id,),
+            )
+            row = await cursor.fetchone()
+
+        if row:
+            return CustomerOut(
+                id=row["id"],
+                name=row["name"],
+                phone=row["phone"],
+                reward_points=row["reward_points"],
+                preferences=row["preferences"],
+            )
+        raise HTTPException(status_code=404, detail="Customer not found")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if "no such table" in str(exc).lower():
+            raise HTTPException(status_code=404, detail="CRM not initialized")
+        raise HTTPException(status_code=500, detail=str(exc))
