@@ -59,6 +59,19 @@ async def lookup_modifiers(keywords: List[str]) -> Dict[str, Any]:
     return {"matched": matched, "unmatched": unmatched}
 
 
+async def get_all_modifier_keywords() -> List[str]:
+    async with get_connection() as conn:
+        cursor = await conn.execute("SELECT keyword FROM modifiers")
+        rows = await cursor.fetchall()
+    return [row["keyword"] for row in rows]
+
+
+async def extract_modifier_keywords(text: str) -> List[str]:
+    keywords = await get_all_modifier_keywords()
+    text_lower = text.lower()
+    return [kw for kw in keywords if kw.lower() in text_lower]
+
+
 async def calculate_totals(subtotal: Decimal, tax_rate: Decimal = Decimal("0.10"), discount: Decimal = Decimal("0")) -> Dict[str, Any]:
     tax = (subtotal * tax_rate).quantize(Decimal("0.01"))
     total = (subtotal + tax - discount).quantize(Decimal("0.01"))
@@ -96,8 +109,8 @@ async def dispatch_kds(order_id: str) -> Dict[str, Any]:
     kds_id = f"kds-{uuid.uuid4().hex[:8]}"
     async with get_connection() as conn:
         await conn.execute(
-            "INSERT INTO kds_orders (id, order_id, items_json, dispatched_at) VALUES (?, ?, ?, ?)",
-            (kds_id, order_id, json.dumps(items_json), _now_iso()),
+            "INSERT INTO kds_orders (id, order_id, items_json, status, dispatched_at) VALUES (?, ?, ?, ?, ?)",
+            (kds_id, order_id, json.dumps(items_json), "dispatched", _now_iso()),
         )
         await conn.commit()
     return {"kds_id": kds_id, "status": "dispatched"}

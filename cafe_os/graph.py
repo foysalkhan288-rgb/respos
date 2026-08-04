@@ -22,6 +22,7 @@ from cafe_os.tools import (
     create_order,
     deduct_inventory,
     dispatch_kds,
+    extract_modifier_keywords,
     get_menu_item,
     lookup_modifiers,
 )
@@ -88,22 +89,35 @@ async def validate_modifiers_node(state: OrderState) -> OrderState:
         modifiers = raw.get("modifiers", []) or []
         special_instructions = raw.get("special_instructions", "") or ""
 
+        # Extract additional modifier keywords from free-text special instructions
+        extracted = await extract_modifier_keywords(special_instructions)
+        merged_modifiers = list(dict.fromkeys(modifiers + extracted))
+
         # Resolve menu item for unit price
         menu = await get_menu_item(menu_item_id)
         unit_price = Decimal(str(menu["menu_item"]["selling_price"]))
 
-        # Add order item (modifiers stored as JSON string of keywords)
+        # Add order item (merged modifiers stored as JSON string of keywords)
         await add_order_item(
             order_id=order_id,
             menu_item_id=menu_item_id,
             quantity=quantity,
             unit_price=unit_price,
-            modifiers=modifiers,
+            modifiers=merged_modifiers,
             special_instructions=special_instructions,
         )
 
-        # Lookup modifiers
-        lookup = await lookup_modifiers(modifiers)
+        # Track item details for response (show original modifiers, not extracted)
+        state["items"].append({
+            "menu_item_id": menu_item_id,
+            "quantity": quantity,
+            "unit_price": float(unit_price),
+            "modifiers": modifiers,
+            "special_instructions": special_instructions,
+        })
+
+        # Lookup merged modifiers
+        lookup = await lookup_modifiers(merged_modifiers)
         state["modifiers"].append(lookup)
 
     return state

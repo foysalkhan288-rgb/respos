@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from decimal import Decimal
 
 import pytest
 import pytest_asyncio
@@ -29,18 +28,15 @@ def temp_db_path():
 async def patched_db(temp_db_path):
     """Monkeypatch DB_PATH before any cafe_os modules are imported."""
     import cafe_os.db as db_module
-    db_module.DB_PATH = temp_db_path
-
-    # Re-bind the connection factory in tools/graph modules
     import cafe_os.tools as tools_module
     import cafe_os.graph as graph_module
-    # They already import get_connection from db, which uses module-level DB_PATH.
-    # We need to reload or re-import after patching. Easiest: importlib.reload.
     import importlib
 
     importlib.reload(db_module)
     importlib.reload(tools_module)
     importlib.reload(graph_module)
+
+    db_module.DB_PATH = temp_db_path
 
     # Initialize schema + seed data
     await db_module.init_db()
@@ -100,10 +96,10 @@ async def test_create_order_with_modifiers(client: AsyncClient):
     assert len(data["items"]) == 1
 
     # Verify inventory deduction via DB
+    import cafe_os.db as db_module
     import aiosqlite
-    from cafe_os.db import DB_PATH
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_module.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         # Whole milk: 250ml * 2 = 500ml deducted
         cursor = await db.execute(
@@ -138,10 +134,10 @@ async def test_create_order_with_modifiers(client: AsyncClient):
         assert row["current_stock"] == pytest.approx(2060.0, abs=0.01)
 
     # Verify KDS row exists
+    import cafe_os.db as db_module
     import aiosqlite
-    from cafe_os.db import DB_PATH
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_module.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM kds_orders WHERE order_id = ?", (data["order_id"],)

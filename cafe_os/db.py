@@ -87,11 +87,14 @@ async def init_db() -> None:
         await conn.close()
 
 
-async def get_connection() -> aiosqlite.Connection:
+@asynccontextmanager
+async def get_connection() -> AsyncGenerator[aiosqlite.Connection, None]:
     conn = await aiosqlite.connect(DB_PATH)
     conn.row_factory = aiosqlite.Row
-    conn.detect_types = aiosqlite.PARSE_DECLTYPES
-    return conn
+    try:
+        yield conn
+    finally:
+        await conn.close()
 
 
 async def seed_sample_data() -> None:
