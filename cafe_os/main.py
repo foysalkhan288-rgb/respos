@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from cafe_os.db import db_lifespan, get_connection
 from cafe_os.graph import run_order
+from cafe_os.tools import get_daily_sales_report, get_menu_engineering, reconcile_shift
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +92,38 @@ class CustomerOut(BaseModel):
     phone: Optional[str] = None
     reward_points: Optional[int] = None
     preferences: Optional[str] = None
+
+
+class ReconcileShiftIn(BaseModel):
+    actual_cash: float = Field(..., ge=0)
+
+
+class ReconcileShiftOut(BaseModel):
+    shift_id: str
+    expected_cash: float
+    actual_cash: float
+    cash_difference: float
+    flagged_for_review: bool
+    status: str
+
+
+class DailySalesOut(BaseModel):
+    date: str
+    gross_revenue: float
+    net_revenue: float
+    tax_collected: float
+    total_orders: int
+    avg_basket_size: float
+    cash_revenue: float
+    card_revenue: float
+    mobile_revenue: float
+    top_item_id: Optional[str] = None
+    top_item_quantity: int = 0
+
+
+class MenuEngineeringOut(BaseModel):
+    matrix: dict
+    summary: dict
 
 
 # ---------------------------------------------------------------------------
@@ -231,4 +264,36 @@ async def get_customer(customer_id: str):
     except Exception as exc:
         if "no such table" in str(exc).lower():
             raise HTTPException(status_code=404, detail="CRM not initialized")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/v1/shifts/{shift_id}/reconcile", response_model=ReconcileShiftOut)
+async def reconcile_shift_endpoint(shift_id: str, payload: ReconcileShiftIn):
+    """Cash drawer reconciliation: compare actual cash vs expected for a shift."""
+    try:
+        result = await reconcile_shift(shift_id, payload.actual_cash)
+        return ReconcileShiftOut(**result)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/v1/reports/daily-sales/{date}", response_model=DailySalesOut)
+async def daily_sales_report_endpoint(date: str):
+    """Get daily sales report for a given date (YYYY-MM-DD)."""
+    try:
+        result = await get_daily_sales_report(date)
+        return DailySalesOut(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/v1/reports/menu-engineering", response_model=MenuEngineeringOut)
+async def menu_engineering_endpoint():
+    """Get menu engineering matrix: Stars, Puzzles, Plowhorses, Dogs."""
+    try:
+        result = await get_menu_engineering()
+        return MenuEngineeringOut(**result)
+    except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

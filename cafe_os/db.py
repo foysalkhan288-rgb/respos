@@ -81,8 +81,38 @@ CREATE TABLE IF NOT EXISTS customers (
     preferences TEXT
 );
 
+CREATE TABLE IF NOT EXISTS shifts (
+    id TEXT PRIMARY KEY,
+    cashier_id TEXT,
+    started_at TEXT,
+    ended_at TEXT,
+    expected_cash REAL DEFAULT 0,
+    actual_cash REAL,
+    cash_difference REAL,
+    payment_method TEXT DEFAULT 'cash',
+    status TEXT DEFAULT 'open'
+);
+
+CREATE TABLE IF NOT EXISTS daily_sales (
+    id TEXT PRIMARY KEY,
+    date TEXT,
+    gross_revenue REAL DEFAULT 0,
+    net_revenue REAL DEFAULT 0,
+    tax_collected REAL DEFAULT 0,
+    total_orders INTEGER DEFAULT 0,
+    avg_basket_size REAL DEFAULT 0,
+    cash_revenue REAL DEFAULT 0,
+    card_revenue REAL DEFAULT 0,
+    mobile_revenue REAL DEFAULT 0,
+    top_item_id TEXT,
+    top_item_quantity INTEGER DEFAULT 0,
+    created_at TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items (order_id);
 CREATE INDEX IF NOT EXISTS idx_kds_orders_order_id ON kds_orders (order_id);
+CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders (created_at);
+CREATE INDEX IF NOT EXISTS idx_orders_payment_method ON orders (payment_method);
 """
 
 
@@ -161,6 +191,20 @@ async def seed_sample_data() -> None:
             [
                 ('cust-001', 'Alice Johnson', '+15551234567', 150, 'Prefers oat milk, extra shot'),
                 ('cust-002', 'Bob Smith', '+15559876543', 50, 'No sugar'),
+            ],
+        )
+
+        await conn.executemany(
+            "INSERT OR IGNORE INTO shifts (id, cashier_id, started_at, status) VALUES (?, ?, ?, ?)",
+            [
+                ('shift-001', 'cashier-001', '2026-08-04T08:00:00Z', 'closed'),
+            ],
+        )
+
+        await conn.executemany(
+            "INSERT OR IGNORE INTO daily_sales (id, date, gross_revenue, net_revenue, tax_collected, total_orders, avg_basket_size, cash_revenue, card_revenue, mobile_revenue, top_item_id, top_item_quantity, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ('sales-001', '2026-08-04', 450.00, 405.00, 45.00, 50, 9.00, 200.00, 200.00, 50.00, 'latte-001', 20, '2026-08-04T23:59:59Z'),
             ],
         )
 
