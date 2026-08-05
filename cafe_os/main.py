@@ -13,7 +13,17 @@ from pydantic import BaseModel, Field
 
 from cafe_os.db import db_lifespan, get_connection
 from cafe_os.graph import run_order
-from cafe_os.tools import get_daily_sales_report, get_menu_engineering, reconcile_shift
+from cafe_os.tools import (
+    get_branch_comparison,
+    get_branches,
+    get_branch_sales,
+    get_daily_sales_report,
+    get_forecast,
+    get_menu_engineering,
+    get_waste_analytics,
+    record_waste,
+    reconcile_shift,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +134,54 @@ class DailySalesOut(BaseModel):
 class MenuEngineeringOut(BaseModel):
     matrix: dict
     summary: dict
+
+
+class WasteRecordIn(BaseModel):
+    ingredient_id: str
+    quantity: float = Field(..., ge=0)
+    unit: str
+    reason: str
+    recorded_by: str
+
+
+class WasteRecordOut(BaseModel):
+    waste_id: str
+    ingredient_id: str
+    quantity: float
+    unit: str
+
+
+class WasteAnalyticsOut(BaseModel):
+    waste_by_ingredient: dict
+    theoretical_consumption: dict
+    variance: dict
+    high_variance_items: List[str]
+
+
+class BranchOut(BaseModel):
+    id: str
+    name: str
+    location: str
+    manager_id: str
+    status: str
+
+
+class BranchSalesOut(BaseModel):
+    branch_id: str
+    days: int
+    sales: List[dict]
+
+
+class BranchComparisonOut(BaseModel):
+    comparison: List[dict]
+
+
+class ForecastOut(BaseModel):
+    forecast: List[dict]
+    method: str
+    based_on_days: int
+    avg_daily_revenue: float
+    avg_daily_orders: float
 
 
 # ---------------------------------------------------------------------------
@@ -295,5 +353,71 @@ async def menu_engineering_endpoint():
     try:
         result = await get_menu_engineering()
         return MenuEngineeringOut(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/v1/inventory/waste", response_model=WasteRecordOut)
+async def record_waste_endpoint(payload: WasteRecordIn):
+    """Record actual waste/spoilage for an ingredient."""
+    try:
+        result = await record_waste(
+            ingredient_id=payload.ingredient_id,
+            quantity=payload.quantity,
+            unit=payload.unit,
+            reason=payload.reason,
+            recorded_by=payload.recorded_by,
+        )
+        return WasteRecordOut(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/v1/reports/waste", response_model=WasteAnalyticsOut)
+async def waste_analytics_endpoint(date: Optional[str] = None):
+    """Get waste analytics: actual vs theoretical consumption variance."""
+    try:
+        result = await get_waste_analytics(date=date)
+        return WasteAnalyticsOut(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/v1/branches", response_model=List[BranchOut])
+async def list_branches():
+    """List all branches."""
+    try:
+        result = await get_branches()
+        return [BranchOut(**b) for b in result["branches"]]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/v1/branches/{branch_id}/sales", response_model=BranchSalesOut)
+async def branch_sales(branch_id: str, days: int = 7):
+    """Get sales for a specific branch over the last N days."""
+    try:
+        result = await get_branch_sales(branch_id, days=days)
+        return BranchSalesOut(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/v1/branches/compare", response_model=BranchComparisonOut)
+async def compare_branches():
+    """Compare performance metrics across all branches."""
+    try:
+        result = await get_branch_comparison()
+        return BranchComparisonOut(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/v1/reports/forecast", response_model=ForecastOut)
+async def forecast_endpoint(days: int = 7):
+    """Get sales forecast for the next N days based on historical data."""
+    try:
+        result = await get_forecast(days=days)
+        return ForecastOut(**result)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

@@ -267,3 +267,171 @@ async def test_order_with_raw_text_field(client: AsyncClient):
     assert data["order_id"].startswith("ord-")
     assert data["payment_status"] == "pending"
     assert data["kds_status"] == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_shift_success(client: AsyncClient):
+    # Create a new open shift for this test
+    import cafe_os.db as db_module
+    import aiosqlite
+    import uuid
+    
+    shift_id = f"shift-{uuid.uuid4().hex[:8]}"
+    async with aiosqlite.connect(db_module.DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO shifts (id, cashier_id, started_at, expected_cash, status) VALUES (?, ?, ?, ?, ?)",
+            (shift_id, 'cashier-test', '2026-08-05T08:00:00Z', 100.00, 'open'),
+        )
+        await db.commit()
+    
+    resp = await client.post(
+        f"/api/v1/shifts/{shift_id}/reconcile",
+        json={"actual_cash": 105.00},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["shift_id"] == shift_id
+    assert data["status"] == "closed"
+    assert data["expected_cash"] == 100.0
+    assert data["actual_cash"] == 105.00
+    assert data["cash_difference"] == 5.00
+    assert data["flagged_for_review"] is False
+
+
+@pytest.mark.asyncio
+async def test_reconcile_shift_flagged(client: AsyncClient):
+    # Create a new open shift for this test
+    import cafe_os.db as db_module
+    import aiosqlite
+    import uuid
+    
+    shift_id = f"shift-{uuid.uuid4().hex[:8]}"
+    async with aiosqlite.connect(db_module.DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO shifts (id, cashier_id, started_at, expected_cash, status) VALUES (?, ?, ?, ?, ?)",
+            (shift_id, 'cashier-test', '2026-08-05T08:00:00Z', 100.00, 'open'),
+        )
+        await db.commit()
+    
+    resp = await client.post(
+        f"/api/v1/shifts/{shift_id}/reconcile",
+        json={"actual_cash": 500.00},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["shift_id"] == shift_id
+    assert data["status"] == "closed"
+    assert data["cash_difference"] == 400.00
+    assert data["flagged_for_review"] is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_shift_invalid(client: AsyncClient):
+    resp = await client.post(
+        "/api/v1/shifts/nonexistent-shift/reconcile",
+        json={"actual_cash": 100.00},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_daily_sales_report(client: AsyncClient):
+    resp = await client.get("/api/v1/reports/daily-sales/2026-08-04")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["date"] == "2026-08-04"
+    assert data["total_orders"] == 50
+    assert data["gross_revenue"] == 450.00
+    assert data["top_item_id"] == "latte-001"
+
+
+@pytest.mark.asyncio
+async def test_daily_sales_report_empty(client: AsyncClient):
+    resp = await client.get("/api/v1/reports/daily-sales/2099-01-01")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_orders"] == 0
+    assert data["gross_revenue"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_menu_engineering(client: AsyncClient):
+    resp = await client.get("/api/v1/reports/menu-engineering")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "matrix" in data
+    assert "summary" in data
+    assert "stars" in data["matrix"]
+    assert "puzzles" in data["matrix"]
+    assert "plowhorses" in data["matrix"]
+    assert "dogs" in data["matrix"]
+    assert isinstance(data["summary"]["total_items"], int)
+    assert data["summary"]["total_items"] == 4
+
+
+@pytest.mark.asyncio
+async def test_record_waste(client: AsyncClient):
+    resp = await client.post(
+        "/api/v1/inventory/waste",
+        json={
+            "ingredient_id": "ing-001",
+            "quantity": 500.0,
+            "unit": "ml",
+            "reason": "Spoiled",
+            "recorded_by": "manager-001",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ingredient_id"] == "ing-001"
+    assert data["quantity"] == 500.0
+    assert data["unit"] == "ml"
+
+
+@pytest.mark.asyncio
+async def test_waste_analytics(client: AsyncClient):
+    resp = await client.get("/api/v1/reports/waste")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "waste_by_ingredient" in data
+    assert "variance" in data
+    assert "high_variance_items" in data
+
+
+@pytest.mark.asyncio
+async def test_list_branches(client: AsyncClient):
+    resp = await client.get("/api/v1/branches")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 2
+    names = {b["name"] for b in data}
+    assert "Downtown Cafe" in names
+
+
+@pytest.mark.asyncio
+async def test_branch_sales(client: AsyncClient):
+    resp = await client.get("/api/v1/branches/branch-001/sales?days=2")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["branch_id"] == "branch-001"
+    assert len(data["sales"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_branch_comparison(client: AsyncClient):
+    resp = await client.get("/api/v1/branches/compare")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "comparison" in data
+    assert len(data["comparison"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_forecast(client: AsyncClient):
+    resp = await client.get("/api/v1/reports/forecast?days=3")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "forecast" in data
+    assert len(data["forecast"]) == 3
+    assert data["method"] == "rolling_avg_30d"
+    assert data["avg_daily_revenue"] > 0

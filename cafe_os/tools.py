@@ -232,61 +232,60 @@ async def get_daily_sales_report(date: str) -> Dict[str, Any]:
         )
         row = await cursor.fetchone()
 
-    if row:
-        return dict(row)
+        if row:
+            return dict(row)
 
-    cursor = await conn.execute(
-        "SELECT SUM(total) as gross, SUM(subtotal) as net, SUM(tax) as tax, COUNT(*) as orders, AVG(total) as avg_basket FROM orders WHERE date(created_at) = ?",
-        (date,),
-    )
-    agg = await cursor.fetchone()
+        cursor = await conn.execute(
+            "SELECT SUM(total) as gross, SUM(subtotal) as net, SUM(tax) as tax, COUNT(*) as orders, AVG(total) as avg_basket FROM orders WHERE date(created_at) = ?",
+            (date,),
+        )
+        agg = await cursor.fetchone()
 
-    cursor = await conn.execute(
-        "SELECT SUM(total) as cash FROM orders WHERE date(created_at) = ? AND payment_method = 'cash'",
-        (date,),
-    )
-    cash = await cursor.fetchone()
+        cursor = await conn.execute(
+            "SELECT SUM(total) as cash FROM orders WHERE date(created_at) = ? AND payment_method = 'cash'",
+            (date,),
+        )
+        cash = await cursor.fetchone()
 
-    cursor = await conn.execute(
-        "SELECT SUM(total) as card FROM orders WHERE date(created_at) = ? AND payment_method = 'card'",
-        (date,),
-    )
-    card = await cursor.fetchone()
+        cursor = await conn.execute(
+            "SELECT SUM(total) as card FROM orders WHERE date(created_at) = ? AND payment_method = 'card'",
+            (date,),
+        )
+        card = await cursor.fetchone()
 
-    cursor = await conn.execute(
-        "SELECT SUM(total) as mobile FROM orders WHERE date(created_at) = ? AND payment_method = 'mobile'",
-        (date,),
-    )
-    mobile = await cursor.fetchone()
+        cursor = await conn.execute(
+            "SELECT SUM(total) as mobile FROM orders WHERE date(created_at) = ? AND payment_method = 'mobile'",
+            (date,),
+        )
+        mobile = await cursor.fetchone()
 
-    cursor = await conn.execute(
-        "SELECT oi.menu_item_id, SUM(oi.quantity) as qty FROM order_items oi JOIN orders o ON oi.order_id = o.id WHERE date(o.created_at) = ? GROUP BY oi.menu_item_id ORDER BY qty DESC LIMIT 1",
-        (date,),
-    )
-    top = await cursor.fetchone()
+        cursor = await conn.execute(
+            "SELECT oi.menu_item_id, SUM(oi.quantity) as qty FROM order_items oi JOIN orders o ON oi.order_id = o.id WHERE date(o.created_at) = ? GROUP BY oi.menu_item_id ORDER BY qty DESC LIMIT 1",
+            (date,),
+        )
+        top = await cursor.fetchone()
 
-    gross = float(agg["gross"] or 0)
-    net = float(agg["net"] or 0)
-    tax = float(agg["tax"] or 0)
-    orders = int(agg["orders"] or 0)
-    avg_basket = float(agg["avg_basket"] or 0)
+        gross = float(agg["gross"] or 0)
+        net = float(agg["net"] or 0)
+        tax = float(agg["tax"] or 0)
+        orders = int(agg["orders"] or 0)
+        avg_basket = float(agg["avg_basket"] or 0)
 
-    report = {
-        "date": date,
-        "gross_revenue": round(gross, 2),
-        "net_revenue": round(net, 2),
-        "tax_collected": round(tax, 2),
-        "total_orders": orders,
-        "avg_basket_size": round(avg_basket, 2),
-        "cash_revenue": round(float(cash["cash"] or 0), 2),
-        "card_revenue": round(float(card["card"] or 0), 2),
-        "mobile_revenue": round(float(mobile["mobile"] or 0), 2),
+        report = {
+            "date": date,
+            "gross_revenue": round(gross, 2),
+            "net_revenue": round(net, 2),
+            "tax_collected": round(tax, 2),
+            "total_orders": orders,
+            "avg_basket_size": round(avg_basket, 2),
+            "cash_revenue": round(float(cash["cash"] or 0), 2),
+            "card_revenue": round(float(card["card"] or 0), 2),
+            "mobile_revenue": round(float(mobile["mobile"] or 0), 2),
         "top_item_id": top["menu_item_id"] if top else None,
-        "top_item_quantity": int(top["qty"] or 0),
-    }
+        "top_item_quantity": int(top["qty"] or 0) if top else 0,
+        }
 
-    report_id = f"sales-{uuid.uuid4().hex[:8]}"
-    async with get_connection() as conn:
+        report_id = f"sales-{uuid.uuid4().hex[:8]}"
         await conn.execute(
             "INSERT INTO daily_sales (id, date, gross_revenue, net_revenue, tax_collected, total_orders, avg_basket_size, cash_revenue, card_revenue, mobile_revenue, top_item_id, top_item_quantity, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
@@ -375,4 +374,138 @@ async def get_menu_engineering() -> Dict[str, Any]:
             "total_items": len(menu_items),
             "avg_margin_percent": round(sum(i["margin_percent"] for i in menu_items) / len(menu_items), 1) if menu_items else 0.0,
         },
+    }
+
+
+async def record_waste(ingredient_id: str, quantity: float, unit: str, reason: str, recorded_by: str) -> Dict[str, Any]:
+    waste_id = f"waste-{uuid.uuid4().hex[:8]}"
+    async with get_connection() as conn:
+        await conn.execute(
+            "INSERT INTO waste_logs (id, ingredient_id, quantity, unit, reason, recorded_by, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (waste_id, ingredient_id, quantity, unit, reason, recorded_by, _now_iso()),
+        )
+        await conn.commit()
+    return {"waste_id": waste_id, "ingredient_id": ingredient_id, "quantity": quantity, "unit": unit}
+
+
+async def get_waste_analytics(date: Optional[str] = None) -> Dict[str, Any]:
+    async with get_connection() as conn:
+        if date:
+            cursor = await conn.execute(
+                "SELECT ingredient_id, SUM(quantity) as total_waste FROM waste_logs WHERE date(recorded_at) = ? GROUP BY ingredient_id",
+                (date,),
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT ingredient_id, SUM(quantity) as total_waste FROM waste_logs GROUP BY ingredient_id",
+            )
+        waste_rows = await cursor.fetchall()
+
+        waste_by_ingredient = {row["ingredient_id"]: float(row["total_waste"] or 0) for row in waste_rows}
+
+        cursor = await conn.execute(
+            "SELECT oi.menu_item_id, SUM(oi.quantity) as qty FROM order_items oi JOIN orders o ON oi.order_id = o.id GROUP BY oi.menu_item_id"
+        )
+        sales_rows = await cursor.fetchall()
+
+        theoretical_consumption = {}
+        for row in sales_rows:
+            menu_item_id = row["menu_item_id"]
+            qty = row["qty"]
+            cursor2 = await conn.execute(
+                "SELECT ingredient_id, unit_qty FROM recipe_bom WHERE menu_item_id = ?",
+                (menu_item_id,),
+            )
+            bom_rows = await cursor2.fetchall()
+            for bom in bom_rows:
+                ing_id = bom["ingredient_id"]
+                theoretical_consumption[ing_id] = theoretical_consumption.get(ing_id, 0) + float(bom["unit_qty"]) * qty
+
+    variance = {}
+    for ing_id, theoretical in theoretical_consumption.items():
+        actual = waste_by_ingredient.get(ing_id, 0)
+        if theoretical > 0:
+            variance_pct = ((actual - theoretical) / theoretical) * 100
+        else:
+            variance_pct = 0.0
+        variance[ing_id] = {
+            "theoretical": round(theoretical, 2),
+            "actual_waste": round(actual, 2),
+            "variance_pct": round(variance_pct, 1),
+            "flagged": abs(variance_pct) > 15.0,
+        }
+
+    return {
+        "waste_by_ingredient": waste_by_ingredient,
+        "theoretical_consumption": theoretical_consumption,
+        "variance": variance,
+        "high_variance_items": [k for k, v in variance.items() if v["flagged"]],
+    }
+
+
+async def get_branches() -> Dict[str, Any]:
+    async with get_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT id, name, location, manager_id, status FROM branches"
+        )
+        rows = await cursor.fetchall()
+    return {"branches": [dict(row) for row in rows]}
+
+
+async def get_branch_sales(branch_id: str, days: int = 7) -> Dict[str, Any]:
+    async with get_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT date, gross_revenue, net_revenue, total_orders, avg_basket_size FROM historical_sales WHERE branch_id = ? ORDER BY date DESC LIMIT ?",
+            (branch_id, days),
+        )
+        rows = await cursor.fetchall()
+    return {
+        "branch_id": branch_id,
+        "days": days,
+        "sales": [dict(row) for row in rows],
+    }
+
+
+async def get_branch_comparison() -> Dict[str, Any]:
+    async with get_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT branch_id, SUM(gross_revenue) as total_revenue, SUM(total_orders) as total_orders, AVG(avg_basket_size) as avg_basket FROM historical_sales GROUP BY branch_id"
+        )
+        rows = await cursor.fetchall()
+    comparison = []
+    for row in rows:
+        comparison.append(dict(row))
+    return {"comparison": comparison}
+
+
+async def get_forecast(days: int = 7) -> Dict[str, Any]:
+    async with get_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT date, SUM(gross_revenue) as daily_revenue, SUM(total_orders) as daily_orders FROM historical_sales GROUP BY date ORDER BY date DESC LIMIT 30"
+        )
+        rows = await cursor.fetchall()
+    
+    if not rows:
+        return {"forecast": [], "method": "no_data"}
+    
+    revenues = [float(row["daily_revenue"] or 0) for row in rows]
+    orders = [float(row["daily_orders"] or 0) for row in rows]
+    
+    avg_revenue = sum(revenues) / len(revenues) if revenues else 0
+    avg_orders = sum(orders) / len(orders) if orders else 0
+    
+    forecast = []
+    for i in range(days):
+        forecast.append({
+            "date_offset": i + 1,
+            "predicted_revenue": round(avg_revenue, 2),
+            "predicted_orders": round(avg_orders, 0),
+        })
+    
+    return {
+        "forecast": forecast,
+        "method": "rolling_avg_30d",
+        "based_on_days": len(revenues),
+        "avg_daily_revenue": round(avg_revenue, 2),
+        "avg_daily_orders": round(avg_orders, 0),
     }

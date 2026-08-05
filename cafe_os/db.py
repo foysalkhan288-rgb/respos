@@ -109,10 +109,42 @@ CREATE TABLE IF NOT EXISTS daily_sales (
     created_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS waste_logs (
+    id TEXT PRIMARY KEY,
+    ingredient_id TEXT,
+    quantity REAL,
+    unit TEXT,
+    reason TEXT,
+    recorded_by TEXT,
+    recorded_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS branches (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    location TEXT,
+    manager_id TEXT,
+    status TEXT DEFAULT 'active'
+);
+
+CREATE TABLE IF NOT EXISTS historical_sales (
+    id TEXT PRIMARY KEY,
+    branch_id TEXT,
+    date TEXT,
+    gross_revenue REAL,
+    net_revenue REAL,
+    tax_collected REAL,
+    total_orders INTEGER,
+    avg_basket_size REAL,
+    created_at TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items (order_id);
 CREATE INDEX IF NOT EXISTS idx_kds_orders_order_id ON kds_orders (order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders (created_at);
 CREATE INDEX IF NOT EXISTS idx_orders_payment_method ON orders (payment_method);
+CREATE INDEX IF NOT EXISTS idx_waste_logs_ingredient_id ON waste_logs (ingredient_id);
+CREATE INDEX IF NOT EXISTS idx_historical_sales_branch_date ON historical_sales (branch_id, date);
 """
 
 
@@ -197,7 +229,7 @@ async def seed_sample_data() -> None:
         await conn.executemany(
             "INSERT OR IGNORE INTO shifts (id, cashier_id, started_at, status) VALUES (?, ?, ?, ?)",
             [
-                ('shift-001', 'cashier-001', '2026-08-04T08:00:00Z', 'closed'),
+                ('shift-001', 'cashier-001', '2026-08-04T08:00:00Z', 'open'),
             ],
         )
 
@@ -205,6 +237,24 @@ async def seed_sample_data() -> None:
             "INSERT OR IGNORE INTO daily_sales (id, date, gross_revenue, net_revenue, tax_collected, total_orders, avg_basket_size, cash_revenue, card_revenue, mobile_revenue, top_item_id, top_item_quantity, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 ('sales-001', '2026-08-04', 450.00, 405.00, 45.00, 50, 9.00, 200.00, 200.00, 50.00, 'latte-001', 20, '2026-08-04T23:59:59Z'),
+            ],
+        )
+
+        await conn.executemany(
+            "INSERT OR IGNORE INTO branches (id, name, location, manager_id, status) VALUES (?, ?, ?, ?, ?)",
+            [
+                ('branch-001', 'Downtown Cafe', '123 Main St', 'mgr-001', 'active'),
+                ('branch-002', 'Airport Cafe', '456 Airport Rd', 'mgr-002', 'active'),
+            ],
+        )
+
+        await conn.executemany(
+            "INSERT OR IGNORE INTO historical_sales (id, branch_id, date, gross_revenue, net_revenue, tax_collected, total_orders, avg_basket_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ('hist-001', 'branch-001', '2026-08-01', 500.00, 450.00, 50.00, 55, 9.09, '2026-08-01T23:59:59Z'),
+                ('hist-002', 'branch-001', '2026-08-02', 520.00, 468.00, 52.00, 58, 8.97, '2026-08-02T23:59:59Z'),
+                ('hist-003', 'branch-002', '2026-08-01', 400.00, 360.00, 40.00, 40, 10.00, '2026-08-01T23:59:59Z'),
+                ('hist-004', 'branch-002', '2026-08-02', 420.00, 378.00, 42.00, 42, 10.00, '2026-08-02T23:59:59Z'),
             ],
         )
 
