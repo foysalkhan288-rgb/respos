@@ -5,57 +5,11 @@ Integration tests for Cafe OS Intelligence Agent — end-to-end order flow.
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 
 import pytest
-import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 
-# ---------------------------------------------------------------------------
-# Test DB setup — use a temp file so tests don't pollute the repo
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope="session")
-def temp_db_path():
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    yield path
-    os.remove(path)
-
-
-@pytest_asyncio.fixture(scope="session", autouse=True)
-async def patched_db(temp_db_path):
-    """Monkeypatch DB_PATH before any cafe_os modules are imported."""
-    import cafe_os.db as db_module
-    import cafe_os.tools as tools_module
-    import cafe_os.graph as graph_module
-    import importlib
-
-    importlib.reload(db_module)
-    importlib.reload(tools_module)
-    importlib.reload(graph_module)
-
-    db_module.DB_PATH = temp_db_path
-
-    # Initialize schema + seed data
-    await db_module.init_db()
-    await db_module.seed_sample_data()
-
-    yield temp_db_path
-
-
-# ---------------------------------------------------------------------------
-# App factory — must be imported AFTER patched_db runs
-# ---------------------------------------------------------------------------
-
-@pytest_asyncio.fixture
-async def client(patched_db):
-    from cafe_os.main import app
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        yield ac
+# Fixtures (temp_db_path, patched_db, client) live in tests/conftest.py
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +35,25 @@ async def test_create_order_with_modifiers(client: AsyncClient):
         "payment_method": "cash",
     }
 
+    # Verify inventory deduction via DB (delta-based — other tests may share the DB)
+    import cafe_os.db as db_module
+    import aiosqlite
+
+    async def _stock(ingredient_id: str) -> float:
+        async with aiosqlite.connect(db_module.DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT current_stock FROM inventory WHERE id = ?", (ingredient_id,)
+            )
+            row = await cursor.fetchone()
+        assert row is not None
+        return row["current_stock"]
+
+    before_milk = await _stock("ing-001")
+    before_oat = await _stock("ing-002")
+    before_shots = await _stock("ing-003")
+    before_whip = await _stock("ing-006")
+
     response = await client.post("/api/v1/orders", json=payload)
     assert response.status_code == 200, response.text
 
@@ -95,48 +68,19 @@ async def test_create_order_with_modifiers(client: AsyncClient):
     assert data["total"] == round(data["subtotal"] + data["tax"], 2)
     assert len(data["items"]) == 1
 
-    # Verify inventory deduction via DB
-    import cafe_os.db as db_module
-    import aiosqlite
+    # Whole milk: 250ml * 2 = 500ml deducted
+    assert await _stock("ing-001") == pytest.approx(before_milk - 500.0, abs=0.01)
 
-    async with aiosqlite.connect(db_module.DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        # Whole milk: 250ml * 2 = 500ml deducted
-        cursor = await db.execute(
-            "SELECT current_stock FROM inventory WHERE id = 'ing-001'"
-        )
-        row = await cursor.fetchone()
-        assert row is not None
-        assert row["current_stock"] == pytest.approx(9500.0, abs=0.01)
+    # Oat milk: 250ml * 2 = 500ml deducted
+    assert await _stock("ing-002") == pytest.approx(before_oat - 500.0, abs=0.01)
 
-        # Oat milk: 250ml * 2 = 500ml deducted
-        cursor = await db.execute(
-            "SELECT current_stock FROM inventory WHERE id = 'ing-002'"
-        )
-        row = await cursor.fetchone()
-        assert row is not None
-        assert row["current_stock"] == pytest.approx(4500.0, abs=0.01)
+    # Espresso shot: 1 * 2 (base) + 1 * 2 (extra shot modifier) = 4 shots
+    assert await _stock("ing-003") == pytest.approx(before_shots - 4.0, abs=0.01)
 
-        # Espresso shot: 1 * 2 + 1 * 2 (base + extra shot) = 4 shots
-        cursor = await db.execute(
-            "SELECT current_stock FROM inventory WHERE id = 'ing-003'"
-        )
-        row = await cursor.fetchone()
-        assert row is not None
-        assert row["current_stock"] == pytest.approx(496.0, abs=0.01)
-
-        # Whip cream: -30ml * 2 = -60ml (i.e. +60ml back because negative deduction)
-        cursor = await db.execute(
-            "SELECT current_stock FROM inventory WHERE id = 'ing-006'"
-        )
-        row = await cursor.fetchone()
-        assert row is not None
-        assert row["current_stock"] == pytest.approx(2060.0, abs=0.01)
+    # Whip cream: -30ml * 2 = -60ml deduction (i.e. +60ml stock back)
+    assert await _stock("ing-006") == pytest.approx(before_whip + 60.0, abs=0.01)
 
     # Verify KDS row exists
-    import cafe_os.db as db_module
-    import aiosqlite
-
     async with aiosqlite.connect(db_module.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -246,6 +190,65 @@ async def test_loyalty_discount_applied(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_loyalty_discount_persisted(client: AsyncClient):
+    """Discount and adjusted total are persisted back to the orders table."""
+    import aiosqlite
+    import cafe_os.db as db_module
+
+    payload = {
+        "counter_number": "C17",
+        "customer_id": "cust-001",
+        "items": [
+            {
+                "menu_item_id": "latte-001",
+                "quantity": 1,
+                "modifiers": [],
+                "special_instructions": "",
+            }
+        ],
+    }
+    response = await client.post("/api/v1/orders", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+
+    async with aiosqlite.connect(db_module.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT discount, total FROM orders WHERE id = ?", (data["order_id"],)
+        )
+        row = await cursor.fetchone()
+    assert row is not None
+    assert row["discount"] == pytest.approx(data["loyalty_discount"], abs=0.01)
+    assert row["total"] == pytest.approx(data["total"], abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_get_order_returns_discount(client: AsyncClient):
+    """GET /orders/{id} surfaces the stored loyalty discount."""
+    payload = {
+        "counter_number": "C18",
+        "customer_id": "cust-001",
+        "items": [
+            {
+                "menu_item_id": "cappuccino-001",
+                "quantity": 1,
+                "modifiers": [],
+                "special_instructions": "",
+            }
+        ],
+    }
+    created = await client.post("/api/v1/orders", json=payload)
+    assert created.status_code == 200
+    order_id = created.json()["order_id"]
+
+    resp = await client.get(f"/api/v1/orders/{order_id}")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["loyalty_discount"] is not None
+    assert data["loyalty_discount"] > 0
+
+
+@pytest.mark.asyncio
 async def test_order_with_raw_text_field(client: AsyncClient):
     """raw_order_text is passed through to graph state (LLM parsing requires API key)."""
     payload = {
@@ -275,7 +278,7 @@ async def test_reconcile_shift_success(client: AsyncClient):
     import cafe_os.db as db_module
     import aiosqlite
     import uuid
-    
+
     shift_id = f"shift-{uuid.uuid4().hex[:8]}"
     async with aiosqlite.connect(db_module.DB_PATH) as db:
         await db.execute(
@@ -283,7 +286,7 @@ async def test_reconcile_shift_success(client: AsyncClient):
             (shift_id, 'cashier-test', '2026-08-05T08:00:00Z', 100.00, 'open'),
         )
         await db.commit()
-    
+
     resp = await client.post(
         f"/api/v1/shifts/{shift_id}/reconcile",
         json={"actual_cash": 105.00},
@@ -304,7 +307,7 @@ async def test_reconcile_shift_flagged(client: AsyncClient):
     import cafe_os.db as db_module
     import aiosqlite
     import uuid
-    
+
     shift_id = f"shift-{uuid.uuid4().hex[:8]}"
     async with aiosqlite.connect(db_module.DB_PATH) as db:
         await db.execute(
@@ -312,7 +315,7 @@ async def test_reconcile_shift_flagged(client: AsyncClient):
             (shift_id, 'cashier-test', '2026-08-05T08:00:00Z', 100.00, 'open'),
         )
         await db.commit()
-    
+
     resp = await client.post(
         f"/api/v1/shifts/{shift_id}/reconcile",
         json={"actual_cash": 500.00},

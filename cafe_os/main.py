@@ -8,11 +8,13 @@ import json
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 from cafe_os.db import db_lifespan, get_connection
 from cafe_os.graph import run_order
+from cafe_os.kds_ws import manager as kds_manager
+from cafe_os.payments import PaymentError, pay_order
 from cafe_os.tools import (
     get_branch_comparison,
     get_branches,
@@ -184,6 +186,29 @@ class ForecastOut(BaseModel):
     avg_daily_orders: float
 
 
+class PaymentIn(BaseModel):
+    payment_method: str = Field(..., pattern="^(cash|card|mobile)$")
+    amount: Optional[float] = Field(None, ge=0)
+
+
+class ReceiptOut(BaseModel):
+    order_id: str
+    payment_status: str
+    payment_method: str
+    amount: float
+    provider: str
+    transaction_id: str
+    client_secret: Optional[str] = None
+
+
+class KDSOrderOut(BaseModel):
+    kds_id: str
+    order_id: str
+    status: str
+    dispatched_at: Optional[str] = None
+    items: List[dict]
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -249,7 +274,7 @@ async def get_order_endpoint(order_id: str):
         kds_status=kds_status,
         inventory_alerts=[],
         customer=None,
-        loyalty_discount=None,
+        loyalty_discount=float(order_row["discount"]) if order_row["discount"] else None,
         error=None,
     )
 
@@ -421,3 +446,66 @@ async def forecast_endpoint(days: int = 7):
         return ForecastOut(**result)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Payments
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/orders/{order_id}/pay", response_model=ReceiptOut)
+async def pay_order_endpoint(order_id: str, payload: PaymentIn):
+    """Charge an order. Cash settles via drawer; card/mobile via gateway (Stripe when configured)."""
+    try:
+        receipt = await pay_order(order_id, payload.payment_method, payload.amount)
+        return ReceiptOut(**receipt)
+    except PaymentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Kitchen Display System
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/kds/orders", response_model=List[KDSOrderOut])
+async def list_kds_orders(status: Optional[str] = None, limit: int = 50):
+    """REST fallback for KDS clients — recent kitchen tickets."""
+    async with get_connection() as db:
+        if status:
+            cursor = await db.execute(
+                "SELECT id, order_id, items_json, status, dispatched_at FROM kds_orders WHERE status = ? ORDER BY dispatched_at DESC LIMIT ?",
+                (status, limit),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT id, order_id, items_json, status, dispatched_at FROM kds_orders ORDER BY dispatched_at DESC LIMIT ?",
+                (limit,),
+            )
+        rows = await cursor.fetchall()
+
+    return [
+        KDSOrderOut(
+            kds_id=row["id"],
+            order_id=row["order_id"],
+            status=row["status"],
+            dispatched_at=row["dispatched_at"],
+            items=json.loads(row["items_json"] or "[]"),
+        )
+        for row in rows
+    ]
+
+
+@app.websocket("/ws/kds")
+async def ws_kds(websocket: WebSocket):
+    """KDS push channel — receives `kds.dispatched` events in real time."""
+    await kds_manager.connect(websocket)
+    try:
+        while True:
+            message = await websocket.receive_text()
+            if message == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        await kds_manager.disconnect(websocket)
+    except Exception:
+        await kds_manager.disconnect(websocket)

@@ -23,6 +23,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
 from cafe_os.db import get_connection
+from cafe_os.kds_ws import manager as kds_manager
 from cafe_os.tools import (
     add_order_item,
     calculate_totals,
@@ -55,6 +56,7 @@ class OrderState(dict):
     counter_number: Optional[str]
     table_number: Optional[str]
     customer_id: Optional[str]
+    payment_method: Optional[str]
     raw_order_text: Optional[str]
     items: Optional[List[Dict[str, Any]]]
     modifiers: Optional[List[Dict[str, Any]]]
@@ -101,6 +103,7 @@ async def parse_order_node(state: OrderState) -> OrderState:
             counter_number=state.get("counter_number", "UNKNOWN"),
             table_number=state.get("table_number"),
             customer_id=state.get("customer_id"),
+            payment_method=state.get("payment_method"),
         )
         state["order_id"] = order_id["order_id"]
         state["payment_status"] = "pending"
@@ -208,6 +211,29 @@ async def dispatch_kds_node(state: OrderState) -> OrderState:
 
     kds = await dispatch_kds(state["order_id"])
     state["kds_payload"] = kds
+
+    # Push the ticket to connected KDS clients over WebSocket (best effort —
+    # a broadcast failure must never break the order flow).
+    try:
+        await kds_manager.broadcast({
+            "type": "kds.dispatched",
+            "kds_id": kds.get("kds_id"),
+            "order_id": state["order_id"],
+            "counter_number": state.get("counter_number"),
+            "status": kds.get("status", "dispatched"),
+            "items": [
+                {
+                    "menu_item_id": item.get("menu_item_id"),
+                    "quantity": item.get("quantity"),
+                    "modifiers": item.get("modifiers", []),
+                    "special_instructions": item.get("special_instructions", ""),
+                }
+                for item in (state.get("items") or [])
+            ],
+            "dispatched_at": _now_iso(),
+        })
+    except Exception:  # pragma: no cover
+        pass
     return state
 
 
@@ -386,6 +412,7 @@ async def run_order(order_payload: Dict[str, Any], use_llm: bool = False) -> Dic
         "counter_number": order_payload.get("counter_number"),
         "table_number": order_payload.get("table_number"),
         "customer_id": order_payload.get("customer_id"),
+        "payment_method": order_payload.get("payment_method"),
         "raw_order_text": order_payload.get("raw_order_text"),
         "items": order_payload.get("items", []),
         "modifiers": None,
@@ -415,6 +442,13 @@ async def run_order(order_payload: Dict[str, Any], use_llm: bool = False) -> Dic
             final_state["total"] = float(
                 (Decimal(str(final_state.get("total") or 0)) - loyalty_discount).quantize(Decimal("0.01"))
             )
+            # Persist discount and adjusted total back to the orders table
+            async with get_connection() as db:
+                await db.execute(
+                    "UPDATE orders SET discount = ?, total = ? WHERE id = ?",
+                    (float(loyalty_discount), final_state["total"], final_state.get("order_id")),
+                )
+                await db.commit()
 
     # Build strict POS response schema
     response = {

@@ -46,6 +46,32 @@ See `.env.example` for required variables.
 
 Once deployed, visit `https://your-url.com/docs` for interactive API docs.
 
+### Kitchen Display System (WebSocket)
+
+KDS clients connect to `/ws/kds` and receive `kds.dispatched` JSON events in
+real time as orders are dispatched — no polling required:
+
+```js
+const ws = new WebSocket("wss://your-url.com/ws/kds");
+ws.onmessage = (e) => console.log(JSON.parse(e.data));
+```
+
+A REST fallback is available at `GET /api/v1/kds/orders`.
+
+### Payments
+
+Charge an order via `POST /api/v1/orders/{order_id}/pay` with body
+`{"payment_method": "cash" | "card" | "mobile"}` (optional `"amount"`).
+Cash settles through the drawer; card/mobile use Stripe when `STRIPE_API_KEY`
+is set, otherwise a local mock gateway approves automatically.
+
+### Seeding
+
+```bash
+python scripts/seed_db.py            # seeds ./cafe_os.db
+python scripts/seed_db.py --db x.db  # seeds a custom path
+```
+
 ## Test
 
 ```bash

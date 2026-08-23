@@ -10,12 +10,12 @@ def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-async def create_order(counter_number: str, table_number: Optional[str] = None, customer_id: Optional[str] = None) -> Dict[str, Any]:
+async def create_order(counter_number: str, table_number: Optional[str] = None, customer_id: Optional[str] = None, payment_method: Optional[str] = None) -> Dict[str, Any]:
     order_id = f"ord-{_now_iso().replace(':','').replace('.','').replace('+','')}-{uuid.uuid4().hex[:8]}"
     async with get_connection() as conn:
         await conn.execute(
-            "INSERT INTO orders (id, counter_number, table_number, customer_id, created_at) VALUES (?, ?, ?, ?, ?)",
-            (order_id, counter_number, table_number, customer_id, _now_iso()),
+            "INSERT INTO orders (id, counter_number, table_number, customer_id, payment_method, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (order_id, counter_number, table_number, customer_id, payment_method, _now_iso()),
         )
         await conn.commit()
     return {"order_id": order_id}
@@ -346,19 +346,45 @@ async def get_menu_engineering() -> Dict[str, Any]:
                 "total_cost": float(total_cost),
                 "profit_margin": float(profit_margin),
                 "margin_percent": round((float(profit_margin) / float(selling)) * 100, 1) if selling > 0 else 0.0,
+                "volume": 0,
+                "order_count": 0,
             })
+
+        cursor_vol = await conn.execute(
+            """SELECT oi.menu_item_id, SUM(oi.quantity) AS volume, COUNT(DISTINCT o.id) AS order_count
+               FROM order_items oi
+               JOIN orders o ON oi.order_id = o.id
+               WHERE o.created_at >= datetime('now', '-30 days')
+               GROUP BY oi.menu_item_id"""
+        )
+        volume_rows = {row["menu_item_id"]: dict(row) for row in await cursor_vol.fetchall()}
+
+    for item in menu_items:
+        stats = volume_rows.get(item["menu_item_id"])
+        if stats:
+            item["volume"] = int(stats["volume"] or 0)
+            item["order_count"] = int(stats["order_count"] or 0)
 
     stars = []
     puzzles = []
     plowhorses = []
     dogs = []
 
+    if menu_items:
+        avg_volume = sum(i["volume"] for i in menu_items) / len(menu_items)
+        avg_margin_percent = sum(i["margin_percent"] for i in menu_items) / len(menu_items)
+    else:
+        avg_volume = 0.0
+        avg_margin_percent = 0.0
+
     for item in menu_items:
-        if item["profit_margin"] >= 2.0 and item.get("_volume", 50) >= 30:
+        high_volume = item["volume"] > 0 and item["volume"] >= avg_volume
+        high_margin = item["margin_percent"] >= avg_margin_percent
+        if high_margin and high_volume:
             stars.append(item)
-        elif item["profit_margin"] >= 2.0 and item.get("_volume", 0) < 30:
+        elif high_margin and not high_volume:
             puzzles.append(item)
-        elif item["profit_margin"] < 2.0 and item.get("_volume", 0) >= 30:
+        elif not high_margin and high_volume:
             plowhorses.append(item)
         else:
             dogs.append(item)
@@ -372,7 +398,9 @@ async def get_menu_engineering() -> Dict[str, Any]:
         },
         "summary": {
             "total_items": len(menu_items),
-            "avg_margin_percent": round(sum(i["margin_percent"] for i in menu_items) / len(menu_items), 1) if menu_items else 0.0,
+            "avg_margin_percent": round(avg_margin_percent, 1),
+            "avg_volume": round(avg_volume, 1),
+            "period_days": 30,
         },
     }
 
@@ -486,7 +514,13 @@ async def get_forecast(days: int = 7) -> Dict[str, Any]:
         rows = await cursor.fetchall()
     
     if not rows:
-        return {"forecast": [], "method": "no_data"}
+        return {
+            "forecast": [],
+            "method": "no_data",
+            "based_on_days": 0,
+            "avg_daily_revenue": 0.0,
+            "avg_daily_orders": 0.0,
+        }
     
     revenues = [float(row["daily_revenue"] or 0) for row in rows]
     orders = [float(row["daily_orders"] or 0) for row in rows]

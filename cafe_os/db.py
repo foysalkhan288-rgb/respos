@@ -264,4 +264,5 @@ async def seed_sample_data() -> None:
 @asynccontextmanager
 async def db_lifespan(app) -> AsyncGenerator[None, None]:
     await init_db()
+    await seed_sample_data()
     yield
