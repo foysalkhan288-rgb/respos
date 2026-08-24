@@ -1,9 +1,14 @@
+import os
 import uuid
 import datetime
 import json
 from decimal import Decimal
 from typing import Dict, List, Any, Optional
 from cafe_os.db import get_connection
+
+TAX_RATE = Decimal(os.environ.get("TAX_RATE", "0.10"))
+
+KDS_STATUSES = {"pending", "dispatched", "preparing", "ready", "served"}
 
 
 def _now_iso() -> str:
@@ -72,7 +77,9 @@ async def extract_modifier_keywords(text: str) -> List[str]:
     return [kw for kw in keywords if kw.lower() in text_lower]
 
 
-async def calculate_totals(subtotal: Decimal, tax_rate: Decimal = Decimal("0.10"), discount: Decimal = Decimal("0")) -> Dict[str, Any]:
+async def calculate_totals(subtotal: Decimal, tax_rate: Optional[Decimal] = None, discount: Decimal = Decimal("0")) -> Dict[str, Any]:
+    if tax_rate is None:
+        tax_rate = TAX_RATE
     tax = (subtotal * tax_rate).quantize(Decimal("0.01"))
     total = (subtotal + tax - discount).quantize(Decimal("0.01"))
     return {
@@ -80,6 +87,26 @@ async def calculate_totals(subtotal: Decimal, tax_rate: Decimal = Decimal("0.10"
         "tax": float(tax),
         "total": float(total),
     }
+
+
+async def update_kds_status(kds_id: str, status: str) -> Dict[str, Any]:
+    """Transition a KDS ticket through its lifecycle (preparing/ready/served)."""
+    if status not in KDS_STATUSES:
+        raise ValueError(f"Invalid KDS status: {status}")
+    async with get_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT id, order_id FROM kds_orders WHERE id = ?",
+            (kds_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise ValueError(f"KDS ticket not found: {kds_id}")
+        await conn.execute(
+            "UPDATE kds_orders SET status = ? WHERE id = ?",
+            (status, kds_id),
+        )
+        await conn.commit()
+    return {"kds_id": kds_id, "order_id": row["order_id"], "status": status}
 
 
 async def dispatch_kds(order_id: str) -> Dict[str, Any]:

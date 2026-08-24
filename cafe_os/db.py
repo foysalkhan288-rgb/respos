@@ -1,9 +1,114 @@
 import aiosqlite
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from functools import lru_cache
+from typing import Any, AsyncGenerator
+import asyncio
 import json
+import os
+import re
 
 DB_PATH = "cafe_os.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+
+def is_postgres() -> bool:
+    return DATABASE_URL.startswith(("postgres://", "postgresql://"))
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL support (opt-in via DATABASE_URL)
+#
+# All application SQL is written in the SQLite dialect. When running against
+# PostgreSQL, statements are translated on the fly:
+#   ? placeholders            -> $1..$n
+#   date(col)                 -> (col::timestamptz)::date
+#   datetime('now', '-X ...') -> (now() + interval '-X ...')
+#   INSERT OR IGNORE          -> INSERT ... ON CONFLICT DO NOTHING
+# Timestamps are stored as ISO-8601 TEXT in both backends, so no schema drift.
+# ---------------------------------------------------------------------------
+
+_DATE_CALL_RE = re.compile(r"date\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\)")
+_NOW_OFFSET_RE = re.compile(r"datetime\(\s*'now'\s*,\s*'([^']+)'\s*\)")
+
+
+@lru_cache(maxsize=1024)
+def _translate_sql(sql: str) -> str:
+    translated = sql
+    if "INSERT OR IGNORE" in translated:
+        translated = translated.replace("INSERT OR IGNORE", "INSERT") + " ON CONFLICT DO NOTHING"
+    translated = _DATE_CALL_RE.sub(r"(\1::timestamptz)::date", translated)
+    translated = _NOW_OFFSET_RE.sub(r"(now() + interval '\1')", translated)
+
+    out = []
+    counter = 0
+    i = 0
+    length = len(translated)
+    while i < length:
+        ch = translated[i]
+        if ch == "'":
+            end = translated.find("'", i + 1)
+            if end == -1:
+                out.append(translated[i:])
+                break
+            out.append(translated[i : end + 1])
+            i = end + 1
+        elif ch == "?":
+            counter += 1
+            out.append(f"${counter}")
+            i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+class _PgCursor:
+    def __init__(self, records: list):
+        self._records = records
+
+    async def fetchone(self):
+        return self._records[0] if self._records else None
+
+    async def fetchall(self):
+        return list(self._records)
+
+
+class _PgConnection:
+    """Minimal aiosqlite-compatible facade over an asyncpg connection."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def execute(self, sql: str, *args: Any) -> _PgCursor:
+        records = await self._conn.fetch(_translate_sql(sql), *args)
+        return _PgCursor(records)
+
+    async def executemany(self, sql: str, seq_of_parameters) -> None:
+        await self._conn.executemany(
+            _translate_sql(sql), [tuple(params) for params in seq_of_parameters]
+        )
+
+    async def commit(self) -> None:
+        return None  # asyncpg autocommits; kept for aiosqlite call-site parity
+
+
+_pg_pool = None
+
+
+async def _get_pg_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        import asyncpg
+
+        _pg_pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=10)
+    return _pg_pool
+
+
+async def close_pg_pool() -> None:
+    global _pg_pool
+    if _pg_pool is not None:
+        await _pg_pool.close()
+        _pg_pool = None
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS menu_items (
@@ -149,6 +254,12 @@ CREATE INDEX IF NOT EXISTS idx_historical_sales_branch_date ON historical_sales 
 
 
 async def init_db() -> None:
+    if is_postgres():
+        pool = await _get_pg_pool()
+        async with pool.acquire() as conn:
+            for statement in filter(None, (s.strip() for s in SCHEMA_SQL.split(";"))):
+                await conn.execute(_translate_sql(statement))
+        return
     conn = await aiosqlite.connect(DB_PATH)
     try:
         await conn.executescript(SCHEMA_SQL)
@@ -158,7 +269,12 @@ async def init_db() -> None:
 
 
 @asynccontextmanager
-async def get_connection() -> AsyncGenerator[aiosqlite.Connection, None]:
+async def get_connection() -> AsyncGenerator[Any, None]:
+    if is_postgres():
+        pool = await _get_pg_pool()
+        async with pool.acquire() as pg_conn:
+            yield _PgConnection(pg_conn)
+        return
     conn = await aiosqlite.connect(DB_PATH)
     conn.row_factory = aiosqlite.Row
     try:
@@ -266,3 +382,4 @@ async def db_lifespan(app) -> AsyncGenerator[None, None]:
     await init_db()
     await seed_sample_data()
     yield
+    await close_pg_pool()

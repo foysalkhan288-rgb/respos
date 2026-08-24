@@ -56,7 +56,9 @@ const ws = new WebSocket("wss://your-url.com/ws/kds");
 ws.onmessage = (e) => console.log(JSON.parse(e.data));
 ```
 
-A REST fallback is available at `GET /api/v1/kds/orders`.
+A REST fallback is available at `GET /api/v1/kds/orders`, and tickets advance
+through their lifecycle via `PATCH /api/v1/kds/{kds_id}` with body
+`{"status": "preparing" | "ready" | "served"}` (pushed to connected KDS clients).
 
 ### Payments
 
@@ -70,6 +72,36 @@ is set, otherwise a local mock gateway approves automatically.
 ```bash
 python scripts/seed_db.py            # seeds ./cafe_os.db
 python scripts/seed_db.py --db x.db  # seeds a custom path
+```
+
+### Health Probes
+
+- `GET /healthz` — liveness (process is up)
+- `GET /readyz` — readiness (verifies database, and Redis when configured; 503 when degraded)
+
+## Production Deployment (PostgreSQL + Redis)
+
+SQLite and in-process KDS delivery are the defaults. For production scale:
+
+```bash
+pip install -e ".[prod]"   # asyncpg + redis drivers
+```
+
+| Variable | Effect |
+|---|---|
+| `DATABASE_URL` | `postgresql://user:pass@host:5432/db` — switches all persistence to PostgreSQL via asyncpg |
+| `REDIS_URL` | `redis://host:6379/0` — fans KDS websocket events out across multiple uvicorn workers |
+
+The PostgreSQL backend translates the SQLite-flavored SQL on the fly
+(placeholders, date functions, upserts); timestamps stay ISO-8601 text in both
+backends, so no schema drift. Redis fan-out uses pub/sub with per-worker
+origin tagging to avoid duplicate deliveries.
+
+Full stack locally with Docker Compose (app + Postgres + Redis):
+
+```bash
+docker compose up --build
+# app on http://localhost:8000 — /docs for API reference
 ```
 
 ## Test

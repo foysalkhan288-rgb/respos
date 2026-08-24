@@ -5,15 +5,22 @@ FastAPI application for Cafe OS Intelligence Agent POS endpoints.
 from __future__ import annotations
 
 import json
+import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from cafe_os.db import db_lifespan, get_connection
+from cafe_os.db import db_lifespan, get_connection, is_postgres
 from cafe_os.graph import run_order
-from cafe_os.kds_ws import manager as kds_manager
+from cafe_os.kds_ws import (
+    REDIS_URL,
+    manager as kds_manager,
+    start_redis_relay,
+    stop_redis_relay,
+)
 from cafe_os.payments import PaymentError, pay_order
 from cafe_os.tools import (
     get_branch_comparison,
@@ -25,6 +32,7 @@ from cafe_os.tools import (
     get_waste_analytics,
     record_waste,
     reconcile_shift,
+    update_kds_status,
 )
 
 
@@ -32,10 +40,24 @@ from cafe_os.tools import (
 # Lifespan
 # ---------------------------------------------------------------------------
 
+logger = logging.getLogger(__name__)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with db_lifespan(app):
-        yield
+        relay = None
+        if REDIS_URL:
+            try:
+                relay = await start_redis_relay()
+                logger.info("KDS redis relay started (%s)", REDIS_URL)
+            except Exception:
+                logger.warning("KDS redis relay failed to start; local-only delivery", exc_info=True)
+        try:
+            yield
+        finally:
+            if relay is not None:
+                await stop_redis_relay(relay)
 
 
 app = FastAPI(
@@ -44,6 +66,41 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+# ---------------------------------------------------------------------------
+# Health checks (deployment probes)
+# ---------------------------------------------------------------------------
+
+@app.get("/healthz")
+async def healthz():
+    """Liveness probe — process is up."""
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+async def readyz():
+    """Readiness probe — verifies database (and Redis, when configured)."""
+    checks = {
+        "backend": "postgres" if is_postgres() else "sqlite",
+        "database": "ok",
+        "redis": "enabled" if kds_manager.redis_enabled else "disabled",
+    }
+    try:
+        async with get_connection() as db:
+            cursor = await db.execute("SELECT 1")
+            await cursor.fetchone()
+    except Exception:
+        checks["database"] = "error"
+
+    if kds_manager.redis_enabled:
+        checks["redis"] = "ok" if await kds_manager.ping_redis() else "error"
+
+    healthy = checks["database"] == "ok"
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={"status": "ok" if healthy else "degraded", **checks},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +264,16 @@ class KDSOrderOut(BaseModel):
     status: str
     dispatched_at: Optional[str] = None
     items: List[dict]
+
+
+class KDSStatusUpdateIn(BaseModel):
+    status: str = Field(..., pattern="^(preparing|ready|served)$")
+
+
+class KDSStatusOut(BaseModel):
+    kds_id: str
+    order_id: str
+    status: str
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +561,24 @@ async def list_kds_orders(status: Optional[str] = None, limit: int = 50):
         )
         for row in rows
     ]
+
+
+@app.patch("/api/v1/kds/{kds_id}", response_model=KDSStatusOut)
+async def update_kds_endpoint(kds_id: str, payload: KDSStatusUpdateIn):
+    """Advance a kitchen ticket through its lifecycle and push the update."""
+    try:
+        result = await update_kds_status(kds_id, payload.status)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "not found" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail)
+    await kds_manager.broadcast({
+        "type": "kds.status_changed",
+        "kds_id": result["kds_id"],
+        "order_id": result["order_id"],
+        "status": result["status"],
+    })
+    return result
 
 
 @app.websocket("/ws/kds")
