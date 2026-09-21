@@ -18,6 +18,7 @@ from cafe_os import kds_bus
 from cafe_os.db import db_lifespan, get_connection
 from cafe_os.graph import run_order, set_checkpointer
 from cafe_os.tools import (
+    delete_order,
     get_branch_comparison,
     get_branches,
     get_branch_sales,
@@ -212,9 +213,17 @@ class KdsOrderOut(BaseModel):
 
 @app.post("/api/v1/orders", response_model=OrderOut)
 async def create_order_endpoint(payload: OrderIn):
-    """Accept a new order, invoke LangGraph, return structured response."""
+    """Accept a new order, invoke LangGraph, return structured response.
+
+    A graph-level failure (e.g. unknown menu_item_id) cleans up the
+    partially-created order row and returns 400 instead of a 500.
+    """
     order_payload = payload.model_dump(by_alias=False)
     result = await run_order(order_payload)
+    if result.get("error"):
+        if result.get("order_id"):
+            await delete_order(result["order_id"])
+        raise HTTPException(status_code=400, detail=result["error"])
     return OrderOut(**result)
 
 

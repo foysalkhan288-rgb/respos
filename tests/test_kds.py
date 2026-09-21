@@ -57,6 +57,26 @@ async def client(patched_db):
 
 
 @pytest.mark.asyncio
+async def test_invalid_menu_item_rolls_back_order(client: AsyncClient):
+    """Bad menu_item_id → 400, and no poisoned order row is left behind."""
+    resp = await client.post("/api/v1/orders", json={
+        "counter_number": "BAD1",
+        "items": [{"menu_item_id": "does-not-exist", "quantity": 1, "modifiers": [], "special_instructions": ""}],
+    })
+    assert resp.status_code == 400, resp.text
+    assert "does-not-exist" in resp.json()["detail"]
+
+    import cafe_os.db as db_module
+
+    async with aiosqlite.connect(db_module.DB_PATH) as conn:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE counter_number = 'BAD1'"
+        )
+        row = await cursor.fetchone()
+        assert row[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_list_kds_orders_rest(client: AsyncClient):
     """POST /orders dispatches to KDS; GET /kds/orders lists the ticket."""
     resp = await client.post("/api/v1/orders", json={

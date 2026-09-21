@@ -520,6 +520,15 @@ async def get_forecast(days: int = 7) -> Dict[str, Any]:
     }
 
 
+async def delete_order(order_id: str) -> None:
+    """Remove an order and its dependent rows (used to clean up failed orders)."""
+    async with get_connection() as conn:
+        await conn.execute("DELETE FROM kds_orders WHERE order_id = ?", (order_id,))
+        await conn.execute("DELETE FROM order_items WHERE order_id = ?", (order_id,))
+        await conn.execute("DELETE FROM orders WHERE id = ?", (order_id,))
+        await conn.commit()
+
+
 KDS_ACTIVE_STATUSES = ("dispatched", "acknowledged", "in_progress")
 KDS_STATUSES = KDS_ACTIVE_STATUSES + ("completed",)
 
