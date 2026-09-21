@@ -10,6 +10,25 @@ python3 -m pytest tests/ -v
 uvicorn cafe_os.main:app --reload
 ```
 
+The server initializes the schema and demo seed data on startup. To seed a
+database file manually (e.g. before deploying), run:
+
+```bash
+python3 scripts/seed_db.py --db path/to/cafe_os.db
+```
+
+Order state is persisted via a SQLite LangGraph checkpointer (in the same DB
+file), so in-flight order graphs survive restarts.
+
+## Kitchen Display (KDS)
+
+- `GET /api/v1/kds/orders` — list active tickets (`?status=`, `?include_completed=true`)
+- `WS /ws/kds` — live channel. On connect the server sends a `snapshot` of
+  active tickets; each new order dispatch pushes `order_dispatched`. Clients
+  send `{"type": "status_update", "kds_id": ..., "status": "acknowledged|in_progress|completed"}`
+  to move a ticket; updates are rebroadcast as `status_changed`. `{"type": "ping"}`
+  returns `{"type": "pong"}`.
+
 ## Deployment
 
 ### Option A: Render (Recommended — Free Tier)

@@ -330,7 +330,24 @@ async def customer_lookup_node(state: OrderState) -> OrderState:
 # Module-level singletons to avoid recompiling on every call
 _graph = None
 _graph_use_llm = None
-_checkpointer = MemorySaver()
+_memory_checkpointer = MemorySaver()
+_active_checkpointer: Any = None
+
+
+def set_checkpointer(saver: Any = None) -> None:
+    """Install the checkpointer used to persist order state.
+
+    Called by the app lifespan with an AsyncSqliteSaver so order state survives
+    restarts. Passing None restores the default in-memory checkpointer. Resets
+    the cached compiled graph so the next call picks up the change.
+    """
+    global _active_checkpointer, _graph
+    _active_checkpointer = saver
+    _graph = None
+
+
+def _get_checkpointer() -> Any:
+    return _active_checkpointer if _active_checkpointer is not None else _memory_checkpointer
 
 
 def build_graph(use_llm: bool = False) -> StateGraph:
@@ -362,7 +379,7 @@ def build_graph(use_llm: bool = False) -> StateGraph:
     graph.add_edge("dispatch_kds", "deduct_inventory")
     graph.add_edge("deduct_inventory", END)
 
-    return graph.compile(checkpointer=_checkpointer)
+    return graph.compile(checkpointer=_get_checkpointer())
 
 
 def get_graph(use_llm: bool = False) -> StateGraph:

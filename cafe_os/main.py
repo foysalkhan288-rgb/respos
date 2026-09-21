@@ -4,25 +4,31 @@ FastAPI application for Cafe OS Intelligence Agent POS endpoints.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import BaseModel, Field
 
+import cafe_os.db as db
+from cafe_os import kds_bus
 from cafe_os.db import db_lifespan, get_connection
-from cafe_os.graph import run_order
+from cafe_os.graph import run_order, set_checkpointer
 from cafe_os.tools import (
     get_branch_comparison,
     get_branches,
     get_branch_sales,
     get_daily_sales_report,
     get_forecast,
+    get_kds_orders,
     get_menu_engineering,
     get_waste_analytics,
     record_waste,
     reconcile_shift,
+    update_kds_status,
 )
 
 
@@ -33,7 +39,15 @@ from cafe_os.tools import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with db_lifespan(app):
-        yield
+        # Persist LangGraph order state to SQLite so it survives restarts.
+        async with AsyncSqliteSaver.from_conn_string(db.DB_PATH) as checkpointer:
+            await checkpointer.setup()
+            set_checkpointer(checkpointer)
+            app.state.checkpointer = checkpointer
+            try:
+                yield
+            finally:
+                set_checkpointer(None)
 
 
 app = FastAPI(
@@ -182,6 +196,14 @@ class ForecastOut(BaseModel):
     based_on_days: int
     avg_daily_revenue: float
     avg_daily_orders: float
+
+
+class KdsOrderOut(BaseModel):
+    kds_id: str
+    order_id: str
+    items: List[dict]
+    status: str
+    dispatched_at: str
 
 
 # ---------------------------------------------------------------------------
@@ -421,3 +443,59 @@ async def forecast_endpoint(days: int = 7):
         return ForecastOut(**result)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/v1/kds/orders", response_model=List[KdsOrderOut])
+async def list_kds_orders(status: Optional[str] = None, include_completed: bool = False):
+    """List kitchen display tickets. Defaults to active (non-completed) ones."""
+    try:
+        result = await get_kds_orders(status=status, include_completed=include_completed)
+        return [KdsOrderOut(**order) for order in result["orders"]]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.websocket("/ws/kds")
+async def kds_websocket(websocket: WebSocket):
+    """Kitchen display channel: live order pushes plus station status updates.
+
+    On connect, sends {"type": "snapshot", "orders": [...]} with all active
+    tickets. Every new dispatch pushes {"type": "order_dispatched", ...}.
+    Clients send {"type": "status_update", "kds_id": ..., "status": ...} with
+    status in acknowledged|in_progress|completed; updates are rebroadcast to
+    all connected displays. {"type": "ping"} gets a {"type": "pong"}.
+    """
+    await websocket.accept()
+    queue = kds_bus.subscribe()
+    sender: Optional[asyncio.Task] = None
+    try:
+        backlog = await get_kds_orders()
+        await websocket.send_json({"type": "snapshot", "orders": backlog["orders"]})
+
+        async def _forward_events() -> None:
+            while True:
+                event = await queue.get()
+                await websocket.send_json(event)
+
+        sender = asyncio.create_task(_forward_events())
+
+        while True:
+            message = await websocket.receive_json()
+            if not isinstance(message, dict):
+                continue
+            msg_type = message.get("type")
+            if msg_type == "status_update":
+                try:
+                    await update_kds_status(str(message.get("kds_id")), str(message.get("status")))
+                except ValueError as exc:
+                    await websocket.send_json({"type": "error", "detail": str(exc)})
+            elif msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if sender is not None:
+            sender.cancel()
+        kds_bus.unsubscribe(queue)

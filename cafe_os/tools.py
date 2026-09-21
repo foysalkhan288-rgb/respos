@@ -3,6 +3,7 @@ import datetime
 import json
 from decimal import Decimal
 from typing import Dict, List, Any, Optional
+from cafe_os import kds_bus
 from cafe_os.db import get_connection
 
 
@@ -107,13 +108,21 @@ async def dispatch_kds(order_id: str) -> Dict[str, Any]:
             "special_instructions": item["special_instructions"],
         })
     kds_id = f"kds-{uuid.uuid4().hex[:8]}"
+    dispatched_at = _now_iso()
     async with get_connection() as conn:
         await conn.execute(
             "INSERT INTO kds_orders (id, order_id, items_json, status, dispatched_at) VALUES (?, ?, ?, ?, ?)",
-            (kds_id, order_id, json.dumps(items_json), "dispatched", _now_iso()),
+            (kds_id, order_id, json.dumps(items_json), "dispatched", dispatched_at),
         )
         await conn.commit()
-    return {"kds_id": kds_id, "status": "dispatched"}
+    await kds_bus.publish({
+        "type": "order_dispatched",
+        "kds_id": kds_id,
+        "order_id": order_id,
+        "items": items_json,
+        "dispatched_at": dispatched_at,
+    })
+    return {"kds_id": kds_id, "order_id": order_id, "status": "dispatched", "items": items_json}
 
 
 async def deduct_inventory(order_id: str) -> Dict[str, Any]:
@@ -509,3 +518,52 @@ async def get_forecast(days: int = 7) -> Dict[str, Any]:
         "avg_daily_revenue": round(avg_revenue, 2),
         "avg_daily_orders": round(avg_orders, 0),
     }
+
+
+KDS_ACTIVE_STATUSES = ("dispatched", "acknowledged", "in_progress")
+KDS_STATUSES = KDS_ACTIVE_STATUSES + ("completed",)
+
+
+async def get_kds_orders(status: Optional[str] = None, include_completed: bool = False) -> Dict[str, Any]:
+    query = "SELECT id, order_id, items_json, status, dispatched_at FROM kds_orders"
+    params: List[Any] = []
+    if status:
+        query += " WHERE status = ?"
+        params.append(status)
+    elif not include_completed:
+        placeholders = ", ".join("?" for _ in KDS_ACTIVE_STATUSES)
+        query += f" WHERE status IN ({placeholders})"
+        params.extend(KDS_ACTIVE_STATUSES)
+    query += " ORDER BY dispatched_at ASC"
+
+    async with get_connection() as conn:
+        cursor = await conn.execute(query, params)
+        rows = await cursor.fetchall()
+
+    orders = [
+        {
+            "kds_id": row["id"],
+            "order_id": row["order_id"],
+            "items": json.loads(row["items_json"] or "[]"),
+            "status": row["status"],
+            "dispatched_at": row["dispatched_at"],
+        }
+        for row in rows
+    ]
+    return {"orders": orders}
+
+
+async def update_kds_status(kds_id: str, status: str) -> Dict[str, Any]:
+    if status not in KDS_STATUSES:
+        raise ValueError(f"Invalid KDS status: {status}")
+
+    async with get_connection() as conn:
+        cursor = await conn.execute("SELECT status FROM kds_orders WHERE id = ?", (kds_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise ValueError(f"KDS order not found: {kds_id}")
+        await conn.execute("UPDATE kds_orders SET status = ? WHERE id = ?", (status, kds_id))
+        await conn.commit()
+
+    await kds_bus.publish({"type": "status_changed", "kds_id": kds_id, "status": status})
+    return {"kds_id": kds_id, "status": status}
