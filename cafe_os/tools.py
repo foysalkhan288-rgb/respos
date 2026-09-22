@@ -233,6 +233,46 @@ async def reconcile_shift(shift_id: str, actual_cash: float) -> Dict[str, Any]:
     }
 
 
+async def open_shift(cashier_id: str, opening_cash: float = 0) -> Dict[str, Any]:
+    """Open a cashier shift; expected_cash starts at the opening float."""
+    shift_id = f"shift-{uuid.uuid4().hex[:8]}"
+    opening = Decimal(str(opening_cash)).quantize(Decimal("0.01"))
+    started_at = _now_iso()
+    async with get_connection() as conn:
+        await conn.execute(
+            "INSERT INTO shifts (id, cashier_id, started_at, expected_cash, status) VALUES (?, ?, ?, ?, 'open')",
+            (shift_id, cashier_id, started_at, float(opening)),
+        )
+        await conn.commit()
+    return {
+        "id": shift_id,
+        "cashier_id": cashier_id,
+        "started_at": started_at,
+        "ended_at": None,
+        "expected_cash": float(opening),
+        "actual_cash": None,
+        "cash_difference": None,
+        "status": "open",
+    }
+
+
+async def get_shifts(status: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List shifts newest-first; pass status='open'/'closed' to filter."""
+    query = (
+        "SELECT id, cashier_id, started_at, ended_at, expected_cash, actual_cash,"
+        " cash_difference, status FROM shifts"
+    )
+    params: tuple = ()
+    if status:
+        query += " WHERE status = ?"
+        params = (status,)
+    query += " ORDER BY started_at DESC"
+    async with get_connection() as conn:
+        cursor = await conn.execute(query, params)
+        rows = await cursor.fetchall()
+    return [dict(row) for row in rows]
+
+
 async def get_daily_sales_report(date: str) -> Dict[str, Any]:
     async with get_connection() as conn:
         cursor = await conn.execute(

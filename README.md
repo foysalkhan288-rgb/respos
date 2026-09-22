@@ -27,6 +27,14 @@ file), so in-flight order graphs survive restarts.
   and adds cash totals to the open shift's `expected_cash` (the given
   `shift_id`, or the only open shift). Paying twice → 400.
 
+## Shifts
+
+- `POST /api/v1/shifts` — `{"cashier_id": "...", "opening_cash"?}` → opens a
+  shift; `expected_cash` starts at the opening float (201).
+- `GET /api/v1/shifts` — list shifts newest-first; `?status=open|closed`.
+- `POST /api/v1/shifts/{id}/reconcile` — counts the drawer, records
+  `actual_cash`/`cash_difference`, and closes the shift.
+
 ## Kitchen Display (KDS)
 
 - `GET /api/v1/kds/orders` — list active tickets (`?status=`, `?include_completed=true`)

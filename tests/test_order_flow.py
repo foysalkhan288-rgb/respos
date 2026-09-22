@@ -550,3 +550,76 @@ async def test_pay_invalid_method(client: AsyncClient):
     resp = await client.post(f"/api/v1/orders/{order_id}/pay", json={"payment_method": "mobile"})
     assert resp.status_code == 200
     assert resp.json()["payment_method"] == "mobile"
+
+
+@pytest.mark.asyncio
+async def test_open_shift_and_list(client: AsyncClient):
+    resp = await client.post("/api/v1/shifts", json={"cashier_id": "cashier-9", "opening_cash": 100})
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["status"] == "open"
+    assert body["cashier_id"] == "cashier-9"
+    assert body["expected_cash"] == pytest.approx(100)
+    assert body["ended_at"] is None
+    shift_id = body["id"]
+
+    resp = await client.get("/api/v1/shifts", params={"status": "open"})
+    assert resp.status_code == 200
+    open_ids = [s["id"] for s in resp.json()]
+    assert shift_id in open_ids
+    assert "shift-001" in open_ids  # seeded shift still open
+
+    resp = await client.get("/api/v1/shifts", params={"status": "closed"})
+    assert resp.status_code == 200
+    assert shift_id not in [s["id"] for s in resp.json()]
+
+
+@pytest.mark.asyncio
+async def test_open_shift_default_opening_cash(client: AsyncClient):
+    resp = await client.post("/api/v1/shifts", json={"cashier_id": "cashier-10"})
+    assert resp.status_code == 201
+    assert resp.json()["expected_cash"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cash_payment_banks_to_new_shift(client: AsyncClient):
+    resp = await client.post("/api/v1/shifts", json={"cashier_id": "cashier-11", "opening_cash": 50})
+    assert resp.status_code == 201
+    shift_id = resp.json()["id"]
+
+    resp = await client.post("/api/v1/orders", json={
+        "counter_number": "S1",
+        "items": [{"menu_item_id": "espresso-001", "quantity": 1, "modifiers": [], "special_instructions": ""}],
+    })
+    order_id = resp.json()["order_id"]
+
+    resp = await client.post(
+        f"/api/v1/orders/{order_id}/pay",
+        json={"payment_method": "cash", "shift_id": shift_id},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["shift_id"] == shift_id
+    total = resp.json()["total"]
+
+    import cafe_os.db as db_module
+    import aiosqlite
+
+    async with aiosqlite.connect(db_module.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT expected_cash FROM shifts WHERE id = ?", (shift_id,))
+        assert (await cursor.fetchone())["expected_cash"] == pytest.approx(50 + total, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_cash_payment_no_autopick_with_multiple_open_shifts(client: AsyncClient):
+    # With shift-001 plus the shifts opened above all open, cash payment
+    # without an explicit shift_id must not guess a drawer.
+    resp = await client.post("/api/v1/orders", json={
+        "counter_number": "S2",
+        "items": [{"menu_item_id": "espresso-001", "quantity": 1, "modifiers": [], "special_instructions": ""}],
+    })
+    order_id = resp.json()["order_id"]
+
+    resp = await client.post(f"/api/v1/orders/{order_id}/pay", json={"payment_method": "cash"})
+    assert resp.status_code == 200
+    assert resp.json()["shift_id"] is None

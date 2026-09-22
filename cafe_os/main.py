@@ -26,7 +26,9 @@ from cafe_os.tools import (
     get_forecast,
     get_kds_orders,
     get_menu_engineering,
+    get_shifts,
     get_waste_analytics,
+    open_shift,
     record_payment,
     record_waste,
     reconcile_shift,
@@ -130,6 +132,22 @@ class ReconcileShiftOut(BaseModel):
     actual_cash: float
     cash_difference: float
     flagged_for_review: bool
+    status: str
+
+
+class OpenShiftIn(BaseModel):
+    cashier_id: str
+    opening_cash: float = Field(default=0, ge=0)
+
+
+class ShiftOut(BaseModel):
+    id: str
+    cashier_id: Optional[str] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    expected_cash: float = 0
+    actual_cash: Optional[float] = None
+    cash_difference: Optional[float] = None
     status: str
 
 
@@ -393,9 +411,26 @@ async def get_customer(customer_id: str):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.post("/api/v1/shifts", response_model=ShiftOut, status_code=201)
+async def open_shift_endpoint(payload: OpenShiftIn):
+    """Open a cashier shift; expected_cash starts at the opening float."""
+    result = await open_shift(payload.cashier_id, payload.opening_cash)
+    return ShiftOut(**result)
+
+
+@app.get("/api/v1/shifts", response_model=List[ShiftOut])
+async def list_shifts_endpoint(status: Optional[str] = None):
+    """List shifts newest-first; pass ?status=open or ?status=closed to filter."""
+    return [ShiftOut(**row) for row in await get_shifts(status)]
+
+
 @app.post("/api/v1/shifts/{shift_id}/reconcile", response_model=ReconcileShiftOut)
 async def reconcile_shift_endpoint(shift_id: str, payload: ReconcileShiftIn):
-    """Cash drawer reconciliation: compare actual cash vs expected for a shift."""
+    """Cash drawer reconciliation: compare actual cash vs expected for a shift.
+
+    Reconciling is what closes a shift — it records the counted drawer,
+    stamps ended_at, and sets status to 'closed'.
+    """
     try:
         result = await reconcile_shift(shift_id, payload.actual_cash)
         return ReconcileShiftOut(**result)
