@@ -520,6 +520,88 @@ async def get_forecast(days: int = 7) -> Dict[str, Any]:
     }
 
 
+PAYMENT_METHODS = ("cash", "card", "mobile")
+
+
+async def record_payment(order_id: str, payment_method: str, shift_id: Optional[str] = None) -> Dict[str, Any]:
+    """Mark an order as paid, accrue loyalty points, and bank cash to a shift.
+
+    Loyalty: customers earn 1 point per whole currency unit of order total.
+    Cash payments add the order total to the open shift's expected_cash —
+    the given shift_id, or the only open shift when there is exactly one.
+    """
+    if payment_method not in PAYMENT_METHODS:
+        raise ValueError(f"Invalid payment method: {payment_method}")
+
+    async with get_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT id, customer_id, total, payment_status FROM orders WHERE id = ?",
+            (order_id,),
+        )
+        order = await cursor.fetchone()
+        if not order:
+            raise LookupError(f"Order not found: {order_id}")
+        if order["payment_status"] == "paid":
+            raise ValueError(f"Order {order_id} is already paid")
+
+        total = Decimal(str(order["total"] or 0))
+        await conn.execute(
+            "UPDATE orders SET payment_status = 'paid', payment_method = ? WHERE id = ?",
+            (payment_method, order_id),
+        )
+
+        points_earned = 0
+        reward_points = None
+        if order["customer_id"]:
+            points_earned = int(total)
+            await conn.execute(
+                "UPDATE customers SET reward_points = reward_points + ? WHERE id = ?",
+                (points_earned, order["customer_id"]),
+            )
+            cursor = await conn.execute(
+                "SELECT reward_points FROM customers WHERE id = ?",
+                (order["customer_id"],),
+            )
+            row = await cursor.fetchone()
+            reward_points = row["reward_points"] if row else None
+
+        banked_shift_id = None
+        if payment_method == "cash":
+            if shift_id:
+                cursor = await conn.execute(
+                    "SELECT id FROM shifts WHERE id = ? AND status = 'open'",
+                    (shift_id,),
+                )
+                shift_row = await cursor.fetchone()
+                if not shift_row:
+                    raise LookupError(f"Open shift not found: {shift_id}")
+                banked_shift_id = shift_id
+            else:
+                cursor = await conn.execute(
+                    "SELECT id FROM shifts WHERE status = 'open'"
+                )
+                open_shifts = await cursor.fetchall()
+                if len(open_shifts) == 1:
+                    banked_shift_id = open_shifts[0]["id"]
+            if banked_shift_id:
+                await conn.execute(
+                    "UPDATE shifts SET expected_cash = expected_cash + ? WHERE id = ?",
+                    (float(total), banked_shift_id),
+                )
+
+        await conn.commit()
+
+    return {
+        "order_id": order_id,
+        "payment_status": "paid",
+        "payment_method": payment_method,
+        "total": float(total),
+        "points_earned": points_earned,
+        "customer_reward_points": reward_points,
+        "shift_id": banked_shift_id,
+    }
+
+
 async def delete_order(order_id: str) -> None:
     """Remove an order and its dependent rows (used to clean up failed orders)."""
     async with get_connection() as conn:

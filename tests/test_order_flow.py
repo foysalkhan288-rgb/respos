@@ -435,3 +435,118 @@ async def test_forecast(client: AsyncClient):
     assert len(data["forecast"]) == 3
     assert data["method"] == "rolling_avg_30d"
     assert data["avg_daily_revenue"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Payments — run last: cash payment mutates the seeded open shift
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pay_order_cash_banks_shift_and_accrues_points(client: AsyncClient):
+    """Cash payment: marks paid, accrues loyalty points, adds to shift expected_cash."""
+    resp = await client.post("/api/v1/orders", json={
+        "counter_number": "P1",
+        "customer_id": "cust-002",
+        "items": [{"menu_item_id": "espresso-001", "quantity": 1, "modifiers": [], "special_instructions": ""}],
+    })
+    assert resp.status_code == 200
+    order_id = resp.json()["order_id"]
+
+    import cafe_os.db as db_module
+    import aiosqlite
+
+    async with aiosqlite.connect(db_module.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT expected_cash FROM shifts WHERE id = 'shift-001'")
+        cash_before = (await cursor.fetchone())["expected_cash"]
+        cursor = await db.execute("SELECT reward_points FROM customers WHERE id = 'cust-002'")
+        points_before = (await cursor.fetchone())["reward_points"]
+
+    resp = await client.post(f"/api/v1/orders/{order_id}/pay", json={"payment_method": "cash"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["payment_status"] == "paid"
+    assert data["payment_method"] == "cash"
+    assert data["shift_id"] == "shift-001"
+    assert data["points_earned"] == int(data["total"])
+
+    async with aiosqlite.connect(db_module.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT expected_cash FROM shifts WHERE id = 'shift-001'")
+        cash_after = (await cursor.fetchone())["expected_cash"]
+        assert cash_after == pytest.approx(cash_before + data["total"], abs=0.01)
+        cursor = await db.execute("SELECT reward_points FROM customers WHERE id = 'cust-002'")
+        points_after = (await cursor.fetchone())["reward_points"]
+        assert points_after == points_before + data["points_earned"]
+
+    # GET reflects the paid status
+    resp = await client.get(f"/api/v1/orders/{order_id}")
+    assert resp.status_code == 200
+    assert resp.json()["payment_status"] == "paid"
+
+
+@pytest.mark.asyncio
+async def test_pay_order_card_does_not_touch_shift(client: AsyncClient):
+    resp = await client.post("/api/v1/orders", json={
+        "counter_number": "P2",
+        "items": [{"menu_item_id": "muffin-001", "quantity": 1, "modifiers": [], "special_instructions": ""}],
+    })
+    order_id = resp.json()["order_id"]
+
+    import cafe_os.db as db_module
+    import aiosqlite
+
+    async with aiosqlite.connect(db_module.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT expected_cash FROM shifts WHERE id = 'shift-001'")
+        cash_before = (await cursor.fetchone())["expected_cash"]
+
+    resp = await client.post(f"/api/v1/orders/{order_id}/pay", json={"payment_method": "card"})
+    assert resp.status_code == 200
+    assert resp.json()["shift_id"] is None
+
+    async with aiosqlite.connect(db_module.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT expected_cash FROM shifts WHERE id = 'shift-001'")
+        cash_after = (await cursor.fetchone())["expected_cash"]
+        assert cash_after == pytest.approx(cash_before, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_pay_order_twice_fails(client: AsyncClient):
+    resp = await client.post("/api/v1/orders", json={
+        "counter_number": "P3",
+        "items": [{"menu_item_id": "espresso-001", "quantity": 1, "modifiers": [], "special_instructions": ""}],
+    })
+    order_id = resp.json()["order_id"]
+
+    resp = await client.post(f"/api/v1/orders/{order_id}/pay", json={"payment_method": "card"})
+    assert resp.status_code == 200
+    resp = await client.post(f"/api/v1/orders/{order_id}/pay", json={"payment_method": "card"})
+    assert resp.status_code == 400
+    assert "already paid" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_pay_nonexistent_order(client: AsyncClient):
+    resp = await client.post("/api/v1/orders/ord-nope/pay", json={"payment_method": "cash"})
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_pay_invalid_method(client: AsyncClient):
+    resp = await client.post("/api/v1/orders", json={
+        "counter_number": "P4",
+        "items": [{"menu_item_id": "espresso-001", "quantity": 1, "modifiers": [], "special_instructions": ""}],
+    })
+    order_id = resp.json()["order_id"]
+
+    resp = await client.post(f"/api/v1/orders/{order_id}/pay", json={"payment_method": "crypto"})
+    assert resp.status_code == 400
+    assert "Invalid payment method" in resp.json()["detail"]
+
+    # Order stays pending and payable afterwards
+    resp = await client.post(f"/api/v1/orders/{order_id}/pay", json={"payment_method": "mobile"})
+    assert resp.status_code == 200
+    assert resp.json()["payment_method"] == "mobile"

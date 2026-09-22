@@ -27,6 +27,7 @@ from cafe_os.tools import (
     get_kds_orders,
     get_menu_engineering,
     get_waste_analytics,
+    record_payment,
     record_waste,
     reconcile_shift,
     update_kds_status,
@@ -207,6 +208,21 @@ class KdsOrderOut(BaseModel):
     dispatched_at: str
 
 
+class PayOrderIn(BaseModel):
+    payment_method: str
+    shift_id: Optional[str] = None
+
+
+class PaymentOut(BaseModel):
+    order_id: str
+    payment_status: str
+    payment_method: str
+    total: float
+    points_earned: int
+    customer_reward_points: Optional[int] = None
+    shift_id: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -225,6 +241,27 @@ async def create_order_endpoint(payload: OrderIn):
             await delete_order(result["order_id"])
         raise HTTPException(status_code=400, detail=result["error"])
     return OrderOut(**result)
+
+
+@app.post("/api/v1/orders/{order_id}/pay", response_model=PaymentOut)
+async def pay_order_endpoint(order_id: str, payload: PayOrderIn):
+    """Record payment for a pending order.
+
+    Marks the order paid, accrues loyalty points (1 pt per whole currency
+    unit of total), and banks cash totals onto the open shift's
+    expected_cash — the given shift_id, or the single open shift.
+    """
+    try:
+        result = await record_payment(
+            order_id,
+            payment_method=payload.payment_method,
+            shift_id=payload.shift_id,
+        )
+        return PaymentOut(**result)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/api/v1/orders/{order_id}", response_model=OrderOut)

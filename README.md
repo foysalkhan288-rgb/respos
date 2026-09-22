@@ -20,6 +20,13 @@ python3 scripts/seed_db.py --db path/to/cafe_os.db
 Order state is persisted via a SQLite LangGraph checkpointer (in the same DB
 file), so in-flight order graphs survive restarts.
 
+## Payments
+
+- `POST /api/v1/orders/{id}/pay` — `{"payment_method": "cash|card|mobile", "shift_id"?}`.
+  Marks the order paid, accrues loyalty points (1 pt per whole currency unit),
+  and adds cash totals to the open shift's `expected_cash` (the given
+  `shift_id`, or the only open shift). Paying twice → 400.
+
 ## Kitchen Display (KDS)
 
 - `GET /api/v1/kds/orders` — list active tickets (`?status=`, `?include_completed=true`)
