@@ -120,42 +120,45 @@ async def validate_modifiers_node(state: OrderState) -> OrderState:
     state["items"] = []
     state["modifiers"] = []
 
-    for raw in raw_items:
-        menu_item_id = raw.get("menu_item_id")
-        quantity = raw.get("quantity", 1)
-        modifiers = raw.get("modifiers", []) or []
-        special_instructions = raw.get("special_instructions", "") or ""
+    try:
+        for raw in raw_items:
+            menu_item_id = raw.get("menu_item_id")
+            quantity = raw.get("quantity", 1)
+            modifiers = raw.get("modifiers", []) or []
+            special_instructions = raw.get("special_instructions", "") or ""
 
-        # Extract additional modifier keywords from free-text special instructions
-        extracted = await extract_modifier_keywords(special_instructions)
-        merged_modifiers = list(dict.fromkeys(modifiers + extracted))
+            # Extract additional modifier keywords from free-text special instructions
+            extracted = await extract_modifier_keywords(special_instructions)
+            merged_modifiers = list(dict.fromkeys(modifiers + extracted))
 
-        # Resolve menu item for unit price
-        menu = await get_menu_item(menu_item_id)
-        unit_price = Decimal(str(menu["menu_item"]["selling_price"]))
+            # Resolve menu item for unit price
+            menu = await get_menu_item(menu_item_id)
+            unit_price = Decimal(str(menu["menu_item"]["selling_price"]))
 
-        # Add order item (merged modifiers stored as JSON string of keywords)
-        await add_order_item(
-            order_id=order_id,
-            menu_item_id=menu_item_id,
-            quantity=quantity,
-            unit_price=unit_price,
-            modifiers=merged_modifiers,
-            special_instructions=special_instructions,
-        )
+            # Add order item (merged modifiers stored as JSON string of keywords)
+            await add_order_item(
+                order_id=order_id,
+                menu_item_id=menu_item_id,
+                quantity=quantity,
+                unit_price=unit_price,
+                modifiers=merged_modifiers,
+                special_instructions=special_instructions,
+            )
 
-        # Track item details for response (show original modifiers, not extracted)
-        state["items"].append({
-            "menu_item_id": menu_item_id,
-            "quantity": quantity,
-            "unit_price": float(unit_price),
-            "modifiers": modifiers,
-            "special_instructions": special_instructions,
-        })
+            # Track item details for response (show original modifiers, not extracted)
+            state["items"].append({
+                "menu_item_id": menu_item_id,
+                "quantity": quantity,
+                "unit_price": float(unit_price),
+                "modifiers": modifiers,
+                "special_instructions": special_instructions,
+            })
 
-        # Lookup merged modifiers
-        lookup = await lookup_modifiers(merged_modifiers)
-        state["modifiers"].append(lookup)
+            # Lookup merged modifiers
+            lookup = await lookup_modifiers(merged_modifiers)
+            state["modifiers"].append(lookup)
+    except Exception as exc:
+        state["error"] = f"validate_modifiers_failed: {exc}"
 
     return state
 
@@ -206,8 +209,11 @@ async def dispatch_kds_node(state: OrderState) -> OrderState:
     if state.get("error"):
         return state
 
-    kds = await dispatch_kds(state["order_id"])
-    state["kds_payload"] = kds
+    try:
+        kds = await dispatch_kds(state["order_id"])
+        state["kds_payload"] = kds
+    except Exception as exc:
+        state["error"] = f"dispatch_kds_failed: {exc}"
     return state
 
 
@@ -216,9 +222,12 @@ async def deduct_inventory_node(state: OrderState) -> OrderState:
     if state.get("error"):
         return state
 
-    result = await deduct_inventory(state["order_id"])
-    state["inventory_deltas"] = result.get("deltas", {})
-    state["low_stock_alerts"] = result.get("alerts", [])
+    try:
+        result = await deduct_inventory(state["order_id"])
+        state["inventory_deltas"] = result.get("deltas", {})
+        state["low_stock_alerts"] = result.get("alerts", [])
+    except Exception as exc:
+        state["error"] = f"deduct_inventory_failed: {exc}"
     return state
 
 
@@ -330,7 +339,24 @@ async def customer_lookup_node(state: OrderState) -> OrderState:
 # Module-level singletons to avoid recompiling on every call
 _graph = None
 _graph_use_llm = None
-_checkpointer = MemorySaver()
+_memory_checkpointer = MemorySaver()
+_active_checkpointer: Any = None
+
+
+def set_checkpointer(saver: Any = None) -> None:
+    """Install the checkpointer used to persist order state.
+
+    Called by the app lifespan with an AsyncSqliteSaver so order state survives
+    restarts. Passing None restores the default in-memory checkpointer. Resets
+    the cached compiled graph so the next call picks up the change.
+    """
+    global _active_checkpointer, _graph
+    _active_checkpointer = saver
+    _graph = None
+
+
+def _get_checkpointer() -> Any:
+    return _active_checkpointer if _active_checkpointer is not None else _memory_checkpointer
 
 
 def build_graph(use_llm: bool = False) -> StateGraph:
@@ -362,7 +388,7 @@ def build_graph(use_llm: bool = False) -> StateGraph:
     graph.add_edge("dispatch_kds", "deduct_inventory")
     graph.add_edge("deduct_inventory", END)
 
-    return graph.compile(checkpointer=_checkpointer)
+    return graph.compile(checkpointer=_get_checkpointer())
 
 
 def get_graph(use_llm: bool = False) -> StateGraph:

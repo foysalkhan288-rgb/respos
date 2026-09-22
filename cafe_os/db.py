@@ -1,9 +1,10 @@
 import aiosqlite
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 import json
 
-DB_PATH = "cafe_os.db"
+DB_PATH = os.environ.get("DB_PATH", "cafe_os.db")
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS menu_items (
@@ -149,7 +150,7 @@ CREATE INDEX IF NOT EXISTS idx_historical_sales_branch_date ON historical_sales 
 
 
 async def init_db() -> None:
-    conn = await aiosqlite.connect(DB_PATH)
+    conn = await aiosqlite.connect(DB_PATH, timeout=30)
     try:
         await conn.executescript(SCHEMA_SQL)
         await conn.commit()
@@ -159,7 +160,7 @@ async def init_db() -> None:
 
 @asynccontextmanager
 async def get_connection() -> AsyncGenerator[aiosqlite.Connection, None]:
-    conn = await aiosqlite.connect(DB_PATH)
+    conn = await aiosqlite.connect(DB_PATH, timeout=30)
     conn.row_factory = aiosqlite.Row
     try:
         yield conn
@@ -264,4 +265,5 @@ async def seed_sample_data() -> None:
 @asynccontextmanager
 async def db_lifespan(app) -> AsyncGenerator[None, None]:
     await init_db()
+    await seed_sample_data()
     yield

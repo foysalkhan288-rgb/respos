@@ -4,25 +4,35 @@ FastAPI application for Cafe OS Intelligence Agent POS endpoints.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import BaseModel, Field
 
+import cafe_os.db as db
+from cafe_os import kds_bus
 from cafe_os.db import db_lifespan, get_connection
-from cafe_os.graph import run_order
+from cafe_os.graph import run_order, set_checkpointer
 from cafe_os.tools import (
+    delete_order,
     get_branch_comparison,
     get_branches,
     get_branch_sales,
     get_daily_sales_report,
     get_forecast,
+    get_kds_orders,
     get_menu_engineering,
+    get_shifts,
     get_waste_analytics,
+    open_shift,
+    record_payment,
     record_waste,
     reconcile_shift,
+    update_kds_status,
 )
 
 
@@ -33,7 +43,15 @@ from cafe_os.tools import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with db_lifespan(app):
-        yield
+        # Persist LangGraph order state to SQLite so it survives restarts.
+        async with AsyncSqliteSaver.from_conn_string(db.DB_PATH) as checkpointer:
+            await checkpointer.setup()
+            set_checkpointer(checkpointer)
+            app.state.checkpointer = checkpointer
+            try:
+                yield
+            finally:
+                set_checkpointer(None)
 
 
 app = FastAPI(
@@ -117,6 +135,22 @@ class ReconcileShiftOut(BaseModel):
     status: str
 
 
+class OpenShiftIn(BaseModel):
+    cashier_id: str
+    opening_cash: float = Field(default=0, ge=0)
+
+
+class ShiftOut(BaseModel):
+    id: str
+    cashier_id: Optional[str] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    expected_cash: float = 0
+    actual_cash: Optional[float] = None
+    cash_difference: Optional[float] = None
+    status: str
+
+
 class DailySalesOut(BaseModel):
     date: str
     gross_revenue: float
@@ -184,16 +218,68 @@ class ForecastOut(BaseModel):
     avg_daily_orders: float
 
 
+class KdsOrderOut(BaseModel):
+    kds_id: str
+    order_id: str
+    items: List[dict]
+    status: str
+    dispatched_at: str
+
+
+class PayOrderIn(BaseModel):
+    payment_method: str
+    shift_id: Optional[str] = None
+
+
+class PaymentOut(BaseModel):
+    order_id: str
+    payment_status: str
+    payment_method: str
+    total: float
+    points_earned: int
+    customer_reward_points: Optional[int] = None
+    shift_id: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
 @app.post("/api/v1/orders", response_model=OrderOut)
 async def create_order_endpoint(payload: OrderIn):
-    """Accept a new order, invoke LangGraph, return structured response."""
+    """Accept a new order, invoke LangGraph, return structured response.
+
+    A graph-level failure (e.g. unknown menu_item_id) cleans up the
+    partially-created order row and returns 400 instead of a 500.
+    """
     order_payload = payload.model_dump(by_alias=False)
     result = await run_order(order_payload)
+    if result.get("error"):
+        if result.get("order_id"):
+            await delete_order(result["order_id"])
+        raise HTTPException(status_code=400, detail=result["error"])
     return OrderOut(**result)
+
+
+@app.post("/api/v1/orders/{order_id}/pay", response_model=PaymentOut)
+async def pay_order_endpoint(order_id: str, payload: PayOrderIn):
+    """Record payment for a pending order.
+
+    Marks the order paid, accrues loyalty points (1 pt per whole currency
+    unit of total), and banks cash totals onto the open shift's
+    expected_cash — the given shift_id, or the single open shift.
+    """
+    try:
+        result = await record_payment(
+            order_id,
+            payment_method=payload.payment_method,
+            shift_id=payload.shift_id,
+        )
+        return PaymentOut(**result)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/api/v1/orders/{order_id}", response_model=OrderOut)
@@ -325,9 +411,26 @@ async def get_customer(customer_id: str):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.post("/api/v1/shifts", response_model=ShiftOut, status_code=201)
+async def open_shift_endpoint(payload: OpenShiftIn):
+    """Open a cashier shift; expected_cash starts at the opening float."""
+    result = await open_shift(payload.cashier_id, payload.opening_cash)
+    return ShiftOut(**result)
+
+
+@app.get("/api/v1/shifts", response_model=List[ShiftOut])
+async def list_shifts_endpoint(status: Optional[str] = None):
+    """List shifts newest-first; pass ?status=open or ?status=closed to filter."""
+    return [ShiftOut(**row) for row in await get_shifts(status)]
+
+
 @app.post("/api/v1/shifts/{shift_id}/reconcile", response_model=ReconcileShiftOut)
 async def reconcile_shift_endpoint(shift_id: str, payload: ReconcileShiftIn):
-    """Cash drawer reconciliation: compare actual cash vs expected for a shift."""
+    """Cash drawer reconciliation: compare actual cash vs expected for a shift.
+
+    Reconciling is what closes a shift — it records the counted drawer,
+    stamps ended_at, and sets status to 'closed'.
+    """
     try:
         result = await reconcile_shift(shift_id, payload.actual_cash)
         return ReconcileShiftOut(**result)
@@ -421,3 +524,59 @@ async def forecast_endpoint(days: int = 7):
         return ForecastOut(**result)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/v1/kds/orders", response_model=List[KdsOrderOut])
+async def list_kds_orders(status: Optional[str] = None, include_completed: bool = False):
+    """List kitchen display tickets. Defaults to active (non-completed) ones."""
+    try:
+        result = await get_kds_orders(status=status, include_completed=include_completed)
+        return [KdsOrderOut(**order) for order in result["orders"]]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.websocket("/ws/kds")
+async def kds_websocket(websocket: WebSocket):
+    """Kitchen display channel: live order pushes plus station status updates.
+
+    On connect, sends {"type": "snapshot", "orders": [...]} with all active
+    tickets. Every new dispatch pushes {"type": "order_dispatched", ...}.
+    Clients send {"type": "status_update", "kds_id": ..., "status": ...} with
+    status in acknowledged|in_progress|completed; updates are rebroadcast to
+    all connected displays. {"type": "ping"} gets a {"type": "pong"}.
+    """
+    await websocket.accept()
+    queue = kds_bus.subscribe()
+    sender: Optional[asyncio.Task] = None
+    try:
+        backlog = await get_kds_orders()
+        await websocket.send_json({"type": "snapshot", "orders": backlog["orders"]})
+
+        async def _forward_events() -> None:
+            while True:
+                event = await queue.get()
+                await websocket.send_json(event)
+
+        sender = asyncio.create_task(_forward_events())
+
+        while True:
+            message = await websocket.receive_json()
+            if not isinstance(message, dict):
+                continue
+            msg_type = message.get("type")
+            if msg_type == "status_update":
+                try:
+                    await update_kds_status(str(message.get("kds_id")), str(message.get("status")))
+                except ValueError as exc:
+                    await websocket.send_json({"type": "error", "detail": str(exc)})
+            elif msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if sender is not None:
+            sender.cancel()
+        kds_bus.unsubscribe(queue)

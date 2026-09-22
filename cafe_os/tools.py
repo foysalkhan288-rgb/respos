@@ -3,6 +3,7 @@ import datetime
 import json
 from decimal import Decimal
 from typing import Dict, List, Any, Optional
+from cafe_os import kds_bus
 from cafe_os.db import get_connection
 
 
@@ -107,13 +108,21 @@ async def dispatch_kds(order_id: str) -> Dict[str, Any]:
             "special_instructions": item["special_instructions"],
         })
     kds_id = f"kds-{uuid.uuid4().hex[:8]}"
+    dispatched_at = _now_iso()
     async with get_connection() as conn:
         await conn.execute(
             "INSERT INTO kds_orders (id, order_id, items_json, status, dispatched_at) VALUES (?, ?, ?, ?, ?)",
-            (kds_id, order_id, json.dumps(items_json), "dispatched", _now_iso()),
+            (kds_id, order_id, json.dumps(items_json), "dispatched", dispatched_at),
         )
         await conn.commit()
-    return {"kds_id": kds_id, "status": "dispatched"}
+    await kds_bus.publish({
+        "type": "order_dispatched",
+        "kds_id": kds_id,
+        "order_id": order_id,
+        "items": items_json,
+        "dispatched_at": dispatched_at,
+    })
+    return {"kds_id": kds_id, "order_id": order_id, "status": "dispatched", "items": items_json}
 
 
 async def deduct_inventory(order_id: str) -> Dict[str, Any]:
@@ -222,6 +231,46 @@ async def reconcile_shift(shift_id: str, actual_cash: float) -> Dict[str, Any]:
         "flagged_for_review": flagged,
         "status": "closed",
     }
+
+
+async def open_shift(cashier_id: str, opening_cash: float = 0) -> Dict[str, Any]:
+    """Open a cashier shift; expected_cash starts at the opening float."""
+    shift_id = f"shift-{uuid.uuid4().hex[:8]}"
+    opening = Decimal(str(opening_cash)).quantize(Decimal("0.01"))
+    started_at = _now_iso()
+    async with get_connection() as conn:
+        await conn.execute(
+            "INSERT INTO shifts (id, cashier_id, started_at, expected_cash, status) VALUES (?, ?, ?, ?, 'open')",
+            (shift_id, cashier_id, started_at, float(opening)),
+        )
+        await conn.commit()
+    return {
+        "id": shift_id,
+        "cashier_id": cashier_id,
+        "started_at": started_at,
+        "ended_at": None,
+        "expected_cash": float(opening),
+        "actual_cash": None,
+        "cash_difference": None,
+        "status": "open",
+    }
+
+
+async def get_shifts(status: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List shifts newest-first; pass status='open'/'closed' to filter."""
+    query = (
+        "SELECT id, cashier_id, started_at, ended_at, expected_cash, actual_cash,"
+        " cash_difference, status FROM shifts"
+    )
+    params: tuple = ()
+    if status:
+        query += " WHERE status = ?"
+        params = (status,)
+    query += " ORDER BY started_at DESC"
+    async with get_connection() as conn:
+        cursor = await conn.execute(query, params)
+        rows = await cursor.fetchall()
+    return [dict(row) for row in rows]
 
 
 async def get_daily_sales_report(date: str) -> Dict[str, Any]:
@@ -509,3 +558,143 @@ async def get_forecast(days: int = 7) -> Dict[str, Any]:
         "avg_daily_revenue": round(avg_revenue, 2),
         "avg_daily_orders": round(avg_orders, 0),
     }
+
+
+PAYMENT_METHODS = ("cash", "card", "mobile")
+
+
+async def record_payment(order_id: str, payment_method: str, shift_id: Optional[str] = None) -> Dict[str, Any]:
+    """Mark an order as paid, accrue loyalty points, and bank cash to a shift.
+
+    Loyalty: customers earn 1 point per whole currency unit of order total.
+    Cash payments add the order total to the open shift's expected_cash —
+    the given shift_id, or the only open shift when there is exactly one.
+    """
+    if payment_method not in PAYMENT_METHODS:
+        raise ValueError(f"Invalid payment method: {payment_method}")
+
+    async with get_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT id, customer_id, total, payment_status FROM orders WHERE id = ?",
+            (order_id,),
+        )
+        order = await cursor.fetchone()
+        if not order:
+            raise LookupError(f"Order not found: {order_id}")
+        if order["payment_status"] == "paid":
+            raise ValueError(f"Order {order_id} is already paid")
+
+        total = Decimal(str(order["total"] or 0))
+        await conn.execute(
+            "UPDATE orders SET payment_status = 'paid', payment_method = ? WHERE id = ?",
+            (payment_method, order_id),
+        )
+
+        points_earned = 0
+        reward_points = None
+        if order["customer_id"]:
+            points_earned = int(total)
+            await conn.execute(
+                "UPDATE customers SET reward_points = reward_points + ? WHERE id = ?",
+                (points_earned, order["customer_id"]),
+            )
+            cursor = await conn.execute(
+                "SELECT reward_points FROM customers WHERE id = ?",
+                (order["customer_id"],),
+            )
+            row = await cursor.fetchone()
+            reward_points = row["reward_points"] if row else None
+
+        banked_shift_id = None
+        if payment_method == "cash":
+            if shift_id:
+                cursor = await conn.execute(
+                    "SELECT id FROM shifts WHERE id = ? AND status = 'open'",
+                    (shift_id,),
+                )
+                shift_row = await cursor.fetchone()
+                if not shift_row:
+                    raise LookupError(f"Open shift not found: {shift_id}")
+                banked_shift_id = shift_id
+            else:
+                cursor = await conn.execute(
+                    "SELECT id FROM shifts WHERE status = 'open'"
+                )
+                open_shifts = await cursor.fetchall()
+                if len(open_shifts) == 1:
+                    banked_shift_id = open_shifts[0]["id"]
+            if banked_shift_id:
+                await conn.execute(
+                    "UPDATE shifts SET expected_cash = expected_cash + ? WHERE id = ?",
+                    (float(total), banked_shift_id),
+                )
+
+        await conn.commit()
+
+    return {
+        "order_id": order_id,
+        "payment_status": "paid",
+        "payment_method": payment_method,
+        "total": float(total),
+        "points_earned": points_earned,
+        "customer_reward_points": reward_points,
+        "shift_id": banked_shift_id,
+    }
+
+
+async def delete_order(order_id: str) -> None:
+    """Remove an order and its dependent rows (used to clean up failed orders)."""
+    async with get_connection() as conn:
+        await conn.execute("DELETE FROM kds_orders WHERE order_id = ?", (order_id,))
+        await conn.execute("DELETE FROM order_items WHERE order_id = ?", (order_id,))
+        await conn.execute("DELETE FROM orders WHERE id = ?", (order_id,))
+        await conn.commit()
+
+
+KDS_ACTIVE_STATUSES = ("dispatched", "acknowledged", "in_progress")
+KDS_STATUSES = KDS_ACTIVE_STATUSES + ("completed",)
+
+
+async def get_kds_orders(status: Optional[str] = None, include_completed: bool = False) -> Dict[str, Any]:
+    query = "SELECT id, order_id, items_json, status, dispatched_at FROM kds_orders"
+    params: List[Any] = []
+    if status:
+        query += " WHERE status = ?"
+        params.append(status)
+    elif not include_completed:
+        placeholders = ", ".join("?" for _ in KDS_ACTIVE_STATUSES)
+        query += f" WHERE status IN ({placeholders})"
+        params.extend(KDS_ACTIVE_STATUSES)
+    query += " ORDER BY dispatched_at ASC"
+
+    async with get_connection() as conn:
+        cursor = await conn.execute(query, params)
+        rows = await cursor.fetchall()
+
+    orders = [
+        {
+            "kds_id": row["id"],
+            "order_id": row["order_id"],
+            "items": json.loads(row["items_json"] or "[]"),
+            "status": row["status"],
+            "dispatched_at": row["dispatched_at"],
+        }
+        for row in rows
+    ]
+    return {"orders": orders}
+
+
+async def update_kds_status(kds_id: str, status: str) -> Dict[str, Any]:
+    if status not in KDS_STATUSES:
+        raise ValueError(f"Invalid KDS status: {status}")
+
+    async with get_connection() as conn:
+        cursor = await conn.execute("SELECT status FROM kds_orders WHERE id = ?", (kds_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise ValueError(f"KDS order not found: {kds_id}")
+        await conn.execute("UPDATE kds_orders SET status = ? WHERE id = ?", (status, kds_id))
+        await conn.commit()
+
+    await kds_bus.publish({"type": "status_changed", "kds_id": kds_id, "status": status})
+    return {"kds_id": kds_id, "status": status}
